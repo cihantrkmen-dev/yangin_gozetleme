@@ -37,6 +37,7 @@ jobs:
           mkdir -p app/src/main/assets/dem
 
           # Özel Dijital İmza Anahtarı (Release Keystore) Oluştur
+          rm -f app/ogm-release.keystore
           keytool -genkeypair -v \
             -keystore app/ogm-release.keystore \
             -alias ogm_cihan \
@@ -107,8 +108,8 @@ jobs:
                   applicationId "tr.gov.ogm.gozetleme"
                   minSdk 26
                   targetSdk 34
-                  versionCode 8
-                  versionName "2.1-SecureAdminPro"
+                  versionCode 9
+                  versionName "2.2-SafeNavPro"
               }
 
               signingConfigs {
@@ -238,23 +239,26 @@ jobs:
           </manifest>
           EOF
 
-          # 8. SecurityManager.kt (Güvenli Kriptografik Motor & Talep Numarası Yönetimi)
+          # 8. SecurityManager.kt (Tek Talep Kodundan Deterministik Lisans Üretimi + Yönetici Hızlı Aktivasyon)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SecurityManager.kt
           package tr.gov.ogm.gozetleme
 
           import android.content.Context
-          import android.content.pm.ApplicationInfo
-          import android.os.Debug
           import android.util.Base64
           import java.security.MessageDigest
           import java.util.Locale
 
           object SecurityManager {
-              private const val PREF_NAME = "ogm_sec_vault_v3"
+              private const val PREF_NAME = "ogm_sec_vault_v4"
 
-              private fun getSecretSalt(): String {
+              private fun getSecretSalt1(): String {
                   val data = intArrayOf(76, 87, 94, 72, 71, 89, 124, 99, 108, 121, 102, 100, 108, 103, 59, 57, 59, 63)
                   return data.map { (it xor 9).toChar() }.joinToString("")
+              }
+
+              private fun getSecretSalt2(): String {
+                  val data = intArrayOf(80, 68, 78, 86, 84, 75, 104, 114, 103, 123, 110, 50, 48, 50, 54, 42)
+                  return data.map { (it xor 11).toChar() }.joinToString("")
               }
 
               fun sha256(input: String): String {
@@ -262,19 +266,21 @@ jobs:
                   return bytes.joinToString("") { "%02X".format(it) }
               }
 
-              fun generateLicenseKey(username: String, fullName: String, dutyPlace: String, phone: String): String {
-                  val normalized = "${username.trim().lowercase(Locale.US)}|${fullName.trim().lowercase(Locale.US)}|${dutyPlace.trim().lowercase(Locale.US)}|${phone.trim()}|${getSecretSalt()}"
+              fun generateRequestCode(username: String, fullName: String, dutyPlace: String, phone: String): String {
+                  val normalized = "${username.trim().lowercase(Locale.US)}|${fullName.trim().lowercase(Locale.US)}|${dutyPlace.trim().lowercase(Locale.US)}|${phone.trim()}|${getSecretSalt1()}"
                   val hash = sha256(normalized)
+                  return "TALEP-${hash.substring(0, 4)}-${hash.substring(4, 8)}"
+              }
+
+              // Yönetici panelinde sadece TALEP-XXXX-XXXX girilerek hatasız lisans anahtarı üretilir
+              fun generateLicenseFromRequestCode(requestCode: String): String {
+                  val cleanReq = requestCode.trim().uppercase(Locale.US)
+                  val hash = sha256("$cleanReq|${getSecretSalt2()}")
                   return "OGM-${hash.substring(0, 4)}-${hash.substring(4, 8)}"
               }
 
-              fun generateRequestCode(username: String, phone: String): String {
-                  val raw = sha256("$username|$phone|${getSecretSalt()}")
-                  return "TALEP-${raw.substring(0, 4)}-${raw.substring(4, 8)}"
-              }
-
               private fun obfuscate(text: String): String {
-                  val key = getSecretSalt().toByteArray()
+                  val key = getSecretSalt1().toByteArray()
                   val input = text.toByteArray(Charsets.UTF_8)
                   val out = ByteArray(input.size)
                   for (i in input.indices) {
@@ -285,7 +291,7 @@ jobs:
 
               private fun deobfuscate(encoded: String): String {
                   return try {
-                      val key = getSecretSalt().toByteArray()
+                      val key = getSecretSalt1().toByteArray()
                       val input = Base64.decode(encoded, Base64.NO_WRAP)
                       val out = ByteArray(input.size)
                       for (i in input.indices) {
@@ -304,13 +310,13 @@ jobs:
                   phone: String,
                   username: String,
                   pass: String
-              ): Triple<String, String, String> {
-                  val license = generateLicenseKey(username, fullName, dutyPlace, phone)
-                  val requestCode = generateRequestCode(username, phone)
+              ): Pair<String, String> {
+                  val requestCode = generateRequestCode(username, fullName, dutyPlace, phone)
+                  val license = generateLicenseFromRequestCode(requestCode)
                   val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
                   prefs.edit()
                       .putString("u_name", obfuscate(username.trim()))
-                      .putString("u_pass", sha256(pass.trim() + getSecretSalt()))
+                      .putString("u_pass", sha256(pass.trim() + getSecretSalt1()))
                       .putString("u_full", obfuscate(fullName.trim()))
                       .putString("u_duty", obfuscate(dutyPlace.trim()))
                       .putString("u_phone", obfuscate(phone.trim()))
@@ -318,7 +324,19 @@ jobs:
                       .putString("u_req_code", requestCode)
                       .putBoolean("u_activated", false)
                       .apply()
-                  return Triple(license, requestCode, username.trim())
+                  return Pair(license, requestCode)
+              }
+
+              fun activateAdminDeviceDirectly(context: Context) {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  prefs.edit()
+                      .putString("u_name", obfuscate("cihan"))
+                      .putString("u_pass", sha256("Cihan2026!" + getSecretSalt1()))
+                      .putString("u_full", obfuscate("Cihan Türkmen"))
+                      .putString("u_duty", obfuscate("Yönetici / Geliştirici"))
+                      .putString("u_phone", obfuscate("Yönetici"))
+                      .putBoolean("u_activated", true)
+                      .apply()
               }
 
               fun verifyAndActivateLicense(context: Context, inputKey: String): Boolean {
@@ -332,11 +350,6 @@ jobs:
                   return false
               }
 
-              // Yönetici paneli için herhangi bir talep kodundan gerçek lisans üretme fonksiyonu
-              fun adminGenerateLicenseForUser(username: String, phone: String, fullName: String, dutyPlace: String): String {
-                  return generateLicenseKey(username, fullName, dutyPlace, phone)
-              }
-
               fun validateLogin(context: Context, username: String, pass: String): Pair<Boolean, String> {
                   val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
                   val savedUser = deobfuscate(prefs.getString("u_name", "") ?: "")
@@ -347,18 +360,13 @@ jobs:
                       return Pair(false, "Kayıtlı kullanıcı bulunamadı. Lütfen önce kayıt olun.")
                   }
                   if (!savedUser.equals(username.trim(), ignoreCase = true) ||
-                      savedPassHash != sha256(pass.trim() + getSecretSalt())) {
+                      savedPassHash != sha256(pass.trim() + getSecretSalt1())) {
                       return Pair(false, "Kullanıcı adı veya şifre hatalı!")
                   }
                   if (!activated) {
                       return Pair(false, "Hesabınız henüz lisans kodu ile aktifleştirilmemiş!")
                   }
                   return Pair(true, "Giriş Başarılı")
-              }
-
-              fun isRegistered(context: Context): Boolean {
-                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-                  return !prefs.getString("u_name", "").isNullOrEmpty()
               }
 
               fun isActivated(context: Context): Boolean {
@@ -375,11 +383,13 @@ jobs:
           }
           EOF
 
-          # 9. AuthActivity.kt (Gizli Yönetici Lisans Üreticisi Entegreli)
+          # 9. AuthActivity.kt (Gizli Yönetici Paneli - Tek Kodla Üretim + Hızlı Aktivasyon)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/AuthActivity.kt
           package tr.gov.ogm.gozetleme
 
           import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.Intent
           import android.graphics.Color
           import android.graphics.Typeface
@@ -387,7 +397,6 @@ jobs:
           import android.os.Bundle
           import android.text.InputType
           import android.view.Gravity
-          import android.view.View
           import android.widget.*
           import androidx.appcompat.app.AppCompatActivity
 
@@ -465,7 +474,7 @@ jobs:
                       setPadding(40, 30, 40, 30)
                   }
                   AlertDialog.Builder(this)
-                      .setTitle("🔑 Cihan Türkmen - Yönetici Modu")
+                      .setTitle("Cihan Türkmen - Yönetici Modu")
                       .setMessage("Yönetici şifresini girin:")
                       .setView(input)
                       .setPositiveButton("Giriş Yap") { _, _ ->
@@ -485,38 +494,49 @@ jobs:
                       setPadding(40, 30, 40, 30)
                   }
 
-                  val etUser = EditText(this).apply { hint = "Kullanıcı Adı" }
-                  val etPhone = EditText(this).apply { hint = "Telefon Numarası" }
-                  val etFull = EditText(this).apply { hint = "Ad Soyad" }
-                  val etDuty = EditText(this).apply { hint = "Görev Yeri" }
+                  val info = TextView(this).apply {
+                      text = "E-postadaki Talep Kodunu girin (Örn: TALEP-7A3F-91C2):"
+                      setPadding(0, 0, 0, 16)
+                  }
+                  val etReqCode = EditText(this).apply {
+                      hint = "TALEP-XXXX-XXXX"
+                  }
 
-                  layout.addView(etUser)
-                  layout.addView(etPhone)
-                  layout.addView(etFull)
-                  layout.addView(etDuty)
+                  layout.addView(info)
+                  layout.addView(etReqCode)
 
                   AlertDialog.Builder(this)
-                      .setTitle("🛠️ Yönetici Lisans Üretici")
+                      .setTitle("Yönetici Lisans Üretici")
                       .setView(layout)
                       .setPositiveButton("Lisans Kodu Üret") { _, _ ->
-                          val u = etUser.text.toString().trim()
-                          val p = etPhone.text.toString().trim()
-                          val f = etFull.text.toString().trim()
-                          val d = etDuty.text.toString().trim()
-                          if (u.isNotEmpty() && p.isNotEmpty()) {
-                              val lic = SecurityManager.adminGenerateLicenseForUser(u, p, f, d)
+                          val req = etReqCode.text.toString().trim()
+                          if (req.startsWith("TALEP-", ignoreCase = true) && req.length >= 10) {
+                              val lic = SecurityManager.generateLicenseFromRequestCode(req)
                               AlertDialog.Builder(this)
-                                  .setTitle("Üretilen Lisans Kodu")
-                                  .setMessage(lic)
-                                  .setPositiveButton("Kopyala ve Kapat") { _, _ ->
-                                      val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                      clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Lisans", lic))
-                                      Toast.makeText(this, "Kopyalandı!", Toast.LENGTH_SHORT).show()
+                                  .setTitle("Onaylanan Lisans Kodu")
+                                  .setMessage("Talep: ${req.uppercase()}\n\nAktivasyon Kodu:\n$lic")
+                                  .setPositiveButton("Kopyala") { _, _ ->
+                                      val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                                      clipboard.setPrimaryClip(ClipData.newPlainText("OGM Lisans", lic))
+                                      Toast.makeText(this, "Lisans kodu kopyalandı!", Toast.LENGTH_SHORT).show()
+                                  }
+                                  .setNeutralButton("Paylaş") { _, _ ->
+                                      val share = Intent(Intent.ACTION_SEND).apply {
+                                          type = "text/plain"
+                                          putExtra(Intent.EXTRA_TEXT, "OGM Gözetleme CBS Aktivasyon Kodunuz: $lic")
+                                      }
+                                      startActivity(Intent.createChooser(share, "Lisans Kodunu Gönder"))
                                   }
                                   .show()
                           } else {
-                              Toast.makeText(this, "Kullanıcı adı ve telefon zorunludur!", Toast.LENGTH_SHORT).show()
+                              Toast.makeText(this, "Lütfen geçerli bir TALEP-XXXX-XXXX kodu girin!", Toast.LENGTH_LONG).show()
                           }
+                      }
+                      .setNeutralButton("Bu Cihazı Aktifleştir") { _, _ ->
+                          SecurityManager.activateAdminDeviceDirectly(this)
+                          Toast.makeText(this, "Yönetici cihazı aktifleştirildi!", Toast.LENGTH_SHORT).show()
+                          startActivity(Intent(this, MainActivity::class.java))
+                          finish()
                       }
                       .setNegativeButton("Kapat", null)
                       .show()
@@ -623,7 +643,7 @@ jobs:
                               return@setOnClickListener
                           }
 
-                          val (_, requestCode, _) = SecurityManager.saveUserRegistration(
+                          val (_, requestCode) = SecurityManager.saveUserRegistration(
                               this@AuthActivity, full, duty, phone, user, pass
                           )
 
@@ -661,7 +681,7 @@ jobs:
                       
                       Talep Kodu     : $requestCode
                       -----------------------------------------------
-                      Not: Gerçek lisans anahtarı kullanıcı tarafından görünmez. Lütfen yönetici panelinden bu talep için lisans kodu üretip kullanıcıya iletin.
+                      Not: Gerçek lisans anahtarı kullanıcı tarafından görünmez. Yönetici panelinde sadece Talep Kodunu girerek onay kodu üretebilirsiniz.
                       Geliştirici: Cihan Türkmen
                   """.trimIndent()
 
@@ -714,7 +734,7 @@ jobs:
           }
           EOF
 
-          # 10. DemEngine.kt
+          # 10. DemEngine.kt (Akıllı Sınır Paftası + Bilinen Nokta Açı Hesabı)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/DemEngine.kt
           package tr.gov.ogm.gozetleme
 
@@ -790,16 +810,51 @@ jobs:
                   }
               }
 
+              // Derece sınırlarına (kuzey/güney/doğu/batı) yakınlık kontrolü ile akıllı komşu pafta seçimi
               fun getSurroundingTilesForGps(lat: Double, lon: Double): List<String> {
                   val cLat = floor(lat).toInt()
                   val cLon = floor(lon).toInt()
+                  val fracLat = lat - cLat
+                  val fracLon = lon - cLon
+
+                  val latOffsets = mutableListOf(0)
+                  if (fracLat > 0.65) latOffsets.add(1)
+                  if (fracLat < 0.35) latOffsets.add(-1)
+
+                  val lonOffsets = mutableListOf(0)
+                  if (fracLon > 0.65) lonOffsets.add(1)
+                  if (fracLon < 0.35) lonOffsets.add(-1)
+
                   val list = ArrayList<String>()
-                  for (dLat in 0..0) {
-                      for (dLon in -1..1) {
+                  for (dLat in latOffsets) {
+                      for (dLon in lonOffsets) {
                           list.add(formatTileKey(cLat + dLat, cLon + dLon))
                       }
                   }
                   return list.distinct()
+              }
+
+              // Bilinen sabit bir kule/tepe referans noktasına gerçek coğrafi azimut ve mesafe hesabı
+              fun calculateBearingAndPitch(
+                  obsLat: Double,
+                  obsLon: Double,
+                  obsAlt: Double,
+                  targetLat: Double,
+                  targetLon: Double,
+                  targetAltOverride: Double? = null
+              ): Triple<Double, Double, Double> {
+                  val meanLatRad = Math.toRadians((obsLat + targetLat) * 0.5)
+                  val dNorth = (targetLat - obsLat) * 111132.92
+                  val dEast = (targetLon - obsLon) * 111412.84 * cos(meanLatRad)
+                  val dist = hypot(dEast, dNorth)
+                  val bearingDeg = (Math.toDegrees(atan2(dEast, dNorth)) + 360.0) % 360.0
+
+                  val targetEle = targetAltOverride ?: getElevation(targetLat, targetLon)
+                  val curvatureDrop = (dist * dist) / (2.0 * earthRadius) * (1.0 - refractionK)
+                  val effTargetEle = targetEle - curvatureDrop
+                  val pitchDeg = if (dist > 1.0) Math.toDegrees(atan2(effTargetEle - obsAlt, dist)) else 0.0
+
+                  return Triple(bearingDeg, pitchDeg, dist)
               }
 
               fun downloadTilesSync(tiles: List<String>, onProgress: (String) -> Unit): Int {
@@ -1111,7 +1166,7 @@ jobs:
           }
           EOF
 
-          # 11. KmlAndCodeCodec.kt
+          # 11. KmlAndCodeCodec.kt (İkili Güzergah: Kalibre Edilmiş + Ham Pusula Hattı Seçeneği)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/KmlAndCodeCodec.kt
           package tr.gov.ogm.gozetleme
 
@@ -1174,7 +1229,12 @@ jobs:
                   obs2: ObserverPacket?,
                   hit: RayHitResult,
                   radioCode: String,
-                  operatorSummary: String
+                  operatorSummary: String,
+                  rawHitForDualPath: RayHitResult? = null,
+                  rawAzimuthDeg: Double = obs1.azimuth,
+                  manualAzOffsetDeg: Double = 0.0,
+                  magneticFieldUt: Float = 0f,
+                  isMagneticAnomaly: Boolean = false
               ): String {
                   val timeStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
                   val polyCoords = hit.polygonPoints.joinToString("\n") {
@@ -1197,7 +1257,36 @@ jobs:
                       """.trimIndent()
                   } else ""
 
+                  val dualRawPathXml = if (rawHitForDualPath != null) {
+                      """
+                      <Placemark>
+                          <name>Ham Pusula Bakış Hattı (Kalibrasyonsuz: ${String.format(Locale.US, "%.1f", rawAzimuthDeg)}°)</name>
+                          <Style><LineStyle><color>ff00a5ff</color><width>2</width></LineStyle></Style>
+                          <LineString>
+                              <altitudeMode>absolute</altitudeMode>
+                              <coordinates>
+                                  ${obs1.lon},${obs1.lat},${obs1.alt}
+                                  ${rawHitForDualPath.hitLon},${rawHitForDualPath.hitLat},${rawHitForDualPath.hitEle}
+                              </coordinates>
+                          </LineString>
+                      </Placemark>
+                      <Placemark>
+                          <name>Ham Pusula Hedefi (Karşılaştırma)</name>
+                          <description><![CDATA[
+                              <b>Not:</b> Kalibrasyon ofseti (${String.format(Locale.US, "%+.1f°", manualAzOffsetDeg)}) uygulanmadan önceki ham sensör hedefi.<br/>
+                              <b>Koordinat:</b> ${String.format(Locale.US, "%.5f, %.5f", rawHitForDualPath.hitLat, rawHitForDualPath.hitLon)}<br/>
+                              <b>Mesafe:</b> ${String.format(Locale.US, "%.0f", rawHitForDualPath.distanceMeters)} m
+                          ]]></description>
+                          <Point>
+                              <altitudeMode>clampToGround</altitudeMode>
+                              <coordinates>${rawHitForDualPath.hitLon},${rawHitForDualPath.hitLat},${rawHitForDualPath.hitEle}</coordinates>
+                          </Point>
+                      </Placemark>
+                      """.trimIndent()
+                  } else ""
+
                   val modeTitle = if (hit.isTriangulated) "İKİLİ KESTİRME HEDEFİ" else "DOĞRUDAN ARAZİ ÇAKIŞTIRMA HEDEFİ"
+                  val magStatus = if (isMagneticAnomaly) "PARAZİT UYARISI (${String.format(Locale.US, "%.1f", magneticFieldUt)} µT)" else "NORMAL (${String.format(Locale.US, "%.1f", magneticFieldUt)} µT)"
 
                   return """<?xml version="1.0" encoding="UTF-8"?>
           <kml xmlns="http://www.opengis.net/kml/2.2">
@@ -1210,6 +1299,9 @@ jobs:
                   <Data name="obs1_lon"><value>${obs1.lon}</value></Data>
                   <Data name="obs1_alt"><value>${obs1.alt}</value></Data>
                   <Data name="azimuth"><value>${obs1.azimuth}</value></Data>
+                  <Data name="raw_azimuth"><value>$rawAzimuthDeg</value></Data>
+                  <Data name="manual_az_offset"><value>$manualAzOffsetDeg</value></Data>
+                  <Data name="magnetic_status"><value>$magStatus</value></Data>
                   <Data name="pitch"><value>${obs1.pitch}</value></Data>
                   <Data name="radio_code"><value>$radioCode</value></Data>
               </ExtendedData>
@@ -1235,6 +1327,7 @@ jobs:
               </Placemark>
 
               $secondLineXml
+              $dualRawPathXml
 
               <Placemark>
                   <name>$modeTitle</name>
@@ -1244,6 +1337,8 @@ jobs:
                       <b>Rakım:</b> ${String.format(Locale.US, "%.0f", hit.hitEle)} m<br/>
                       <b>Mesafe:</b> ${String.format(Locale.US, "%.0f", hit.distanceMeters)} m<br/>
                       <b>Azimut / Eğim:</b> ${String.format(Locale.US, "%.1f° / %.1f°", obs1.azimuth, obs1.pitch)}<br/>
+                      <b>Yatay Kalibrasyon Sapması:</b> ${String.format(Locale.US, "%+.1f°", manualAzOffsetDeg)} (Ham: ${String.format(Locale.US, "%.1f°", rawAzimuthDeg)})<br/>
+                      <b>Manyetik Alan Durumu:</b> $magStatus<br/>
                       <b>Hata Payı:</b> ±${String.format(Locale.US, "%.0f", hit.radialErrorMeters)} m (Boyuna) / ±${String.format(Locale.US, "%.0f", hit.lateralErrorMeters)} m (Enine)<br/>
                       <b>Kestirme Telsiz Kodu:</b> $radioCode<br/>
                       <b>Yazılım Geliştirici:</b> Cihan Türkmen
@@ -1277,7 +1372,7 @@ jobs:
           }
           EOF
 
-          # 12. SensorFusion.kt
+          # 12. SensorFusion.kt (3B Optik Vektör + Gerçek Zamanlı Manyetik Anomali Tespiti)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
           package tr.gov.ogm.gozetleme
 
@@ -1291,17 +1386,42 @@ jobs:
 
           class SensorFusion(
               private val context: Context,
-              private val onOrientationChanged: (azimuthTrueDeg: Float, pitchDeg: Float, rollDeg: Float) -> Unit
+              private val onOrientationChanged: (
+                  azimuthTrueDeg: Float,
+                  rawAzimuthTrueDeg: Float,
+                  pitchDeg: Float,
+                  fieldStrengthUt: Float,
+                  expectedFieldUt: Float,
+                  isAnomaly: Boolean,
+                  anomalyReason: String
+              ) -> Unit
           ) : SensorEventListener {
 
               private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
               private val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+              private val magneticSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
               private val rotationMatrix = FloatArray(9)
 
               var magneticDeclination: Float = 5.6f
+              var expectedFieldStrengthUt: Float = 47.0f
               var manualAzimuthOffset: Float = 0f
               var manualPitchOffset: Float = 0f
+
+              var lastRawAzimuthTrueDeg: Float = 0f
+                  private set
+              var currentFieldStrengthUt: Float = 47.0f
+                  private set
+              var isMagneticAnomaly: Boolean = false
+                  private set
+              var anomalyReason: String = ""
+                  private set
+
+              private var magAccuracy: Int = SensorManager.SENSOR_STATUS_ACCURACY_HIGH
+              private val magHistory = FloatArray(10)
+              private var magIdx = 0
+              private var magSamples = 0
+              private var fieldJitterUt = 0f
 
               private var smoothSinAz = 0f
               private var smoothCosAz = 1f
@@ -1311,11 +1431,21 @@ jobs:
               fun updateDeclination(lat: Double, lon: Double, alt: Double) {
                   val field = GeomagneticField(lat.toFloat(), lon.toFloat(), alt.toFloat(), System.currentTimeMillis())
                   magneticDeclination = field.declination
+                  expectedFieldStrengthUt = (field.fieldStrength / 1000f).coerceIn(30f, 65f)
+              }
+
+              fun calibrateAzimuthToKnownBearing(trueBearingDeg: Double): Float {
+                  val diff = ((trueBearingDeg - lastRawAzimuthTrueDeg.toDouble() + 540.0) % 360.0) - 180.0
+                  manualAzimuthOffset = diff.toFloat()
+                  return manualAzimuthOffset
               }
 
               fun start() {
                   rotationSensor?.let {
                       sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                  }
+                  magneticSensor?.let {
+                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
                   }
               }
 
@@ -1323,8 +1453,62 @@ jobs:
                   sensorManager.unregisterListener(this)
               }
 
+              private fun evaluateMagneticHealth() {
+                  if (magneticSensor == null) {
+                      isMagneticAnomaly = false
+                      anomalyReason = ""
+                      return
+                  }
+                  val deviation = abs(currentFieldStrengthUt - expectedFieldStrengthUt)
+                  when {
+                      deviation > 15f || currentFieldStrengthUt < 25f || currentFieldStrengthUt > 70f -> {
+                          isMagneticAnomaly = true
+                          anomalyReason = "Manyetik alan şiddeti anormal (Metal/Telsiz yakın)"
+                      }
+                      fieldJitterUt > 6f -> {
+                          isMagneticAnomaly = true
+                          anomalyReason = "Manyetik alan kararsız / dalgalı"
+                      }
+                      magAccuracy == SensorManager.SENSOR_STATUS_UNRELIABLE ||
+                      magAccuracy == SensorManager.SENSOR_STATUS_ACCURACY_LOW -> {
+                          isMagneticAnomaly = true
+                          anomalyReason = "Pusula kalibrasyon doğruluğu düşük"
+                      }
+                      else -> {
+                          isMagneticAnomaly = false
+                          anomalyReason = ""
+                      }
+                  }
+              }
+
               override fun onSensorChanged(event: SensorEvent?) {
-                  if (event?.sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
+                  if (event == null) return
+
+                  if (event.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) {
+                      val mx = event.values[0]
+                      val my = event.values[1]
+                      val mz = event.values[2]
+                      val mag = sqrt(mx * mx + my * my + mz * mz)
+                      currentFieldStrengthUt = currentFieldStrengthUt * 0.7f + mag * 0.3f
+
+                      magHistory[magIdx] = mag
+                      magIdx = (magIdx + 1) % magHistory.size
+                      if (magSamples < magHistory.size) magSamples++
+
+                      if (magSamples >= 5) {
+                          var minV = Float.MAX_VALUE
+                          var maxV = Float.MIN_VALUE
+                          for (i in 0 until magSamples) {
+                              if (magHistory[i] < minV) minV = magHistory[i]
+                              if (magHistory[i] > maxV) maxV = magHistory[i]
+                          }
+                          fieldJitterUt = maxV - minV
+                      }
+                      evaluateMagneticHealth()
+                      return
+                  }
+
+                  if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
 
                   SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
 
@@ -1341,17 +1525,33 @@ jobs:
                   smoothPitch = smoothPitch + alpha * (rawPitchDeg - smoothPitch)
 
                   val filteredAzDeg = Math.toDegrees(atan2(smoothSinAz.toDouble(), smoothCosAz.toDouble())).toFloat()
-                  val trueAzimuth = (filteredAzDeg + magneticDeclination + manualAzimuthOffset + 360f) % 360f
+                  val rawTrueAz = (filteredAzDeg + magneticDeclination + 360f) % 360f
+                  lastRawAzimuthTrueDeg = rawTrueAz
+
+                  val calibratedAz = (rawTrueAz + manualAzimuthOffset + 360f) % 360f
                   val calibratedPitch = (smoothPitch + manualPitchOffset).coerceIn(-89f, 89f)
 
-                  onOrientationChanged(trueAzimuth, calibratedPitch, 0f)
+                  onOrientationChanged(
+                      calibratedAz,
+                      rawTrueAz,
+                      calibratedPitch,
+                      currentFieldStrengthUt,
+                      expectedFieldStrengthUt,
+                      isMagneticAnomaly,
+                      anomalyReason
+                  )
               }
 
-              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+                  if (sensor?.type == Sensor.TYPE_MAGNETIC_FIELD) {
+                      magAccuracy = accuracy
+                      evaluateMagneticHealth()
+                  }
+              }
           }
           EOF
 
-          # 13. ArOverlayView.kt
+          # 13. ArOverlayView.kt (Yatay Kalibrasyon Kilidi + Orijinal Sıfır Referans Çizgisi + Anomali Uyarısı)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/ArOverlayView.kt
           package tr.gov.ogm.gozetleme
 
@@ -1368,10 +1568,18 @@ jobs:
           ) : View(context) {
 
               var currentAzimuth = 0f
+              var rawAzimuth = 0f
+              var manualAzimuthOffset = 0f
               var currentPitch = 0f
               var currentZoomRatio = 1.0f
               var baseHorizontalFov = 62f
               var baseVerticalFov = 46f
+
+              var isHorizontalCalLocked = true
+              var isMagneticAnomaly = false
+              var magneticFieldUt = 47f
+              var expectedFieldUt = 47f
+              var anomalyReason = ""
 
               var horizonProfile: List<HorizonProfilePoint> = emptyList()
               var currentHit: RayHitResult? = null
@@ -1399,6 +1607,20 @@ jobs:
                   style = Paint.Style.STROKE
               }
 
+              private val paintRawZeroLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#FFFF9100")
+                  strokeWidth = 3f
+                  style = Paint.Style.STROKE
+                  pathEffect = DashPathEffect(floatArrayOf(16f, 12f), 0f)
+              }
+
+              private val paintRawZeroText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#FFFFAB40")
+                  textSize = 22f
+                  typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                  setShadowLayer(4f, 2f, 2f, Color.BLACK)
+              }
+
               private val paintSecondRay = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                   color = Color.YELLOW
                   strokeWidth = 4f
@@ -1408,14 +1630,25 @@ jobs:
 
               private val paintText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                   color = Color.WHITE
-                  textSize = 26f
+                  textSize = 24f
                   typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
                   setShadowLayer(4f, 2f, 2f, Color.BLACK)
               }
 
+              private val paintWarnBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#CCBF360C")
+                  style = Paint.Style.FILL
+              }
+
+              private val paintWarnText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  textSize = 23f
+                  typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+              }
+
               private val paintDevSignature = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#CC00E676")
-                  textSize = 22f
+                  color = Color.parseColor("#DD00E676")
+                  textSize = 21f
                   typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                   setShadowLayer(4f, 2f, 2f, Color.BLACK)
               }
@@ -1438,7 +1671,9 @@ jobs:
 
                           val effHFov = baseHorizontalFov / currentZoomRatio
                           val effVFov = baseVerticalFov / currentZoomRatio
-                          val dAz = -(dx / width.toFloat()) * effHFov
+
+                          // Yatay kalibrasyon kilitliyse pusula ofseti kazara değiştirilemez; sadece dikey ince ayar yapılır
+                          val dAz = if (isHorizontalCalLocked) 0f else -(dx / width.toFloat()) * effHFov
                           val dPitch = (dy / height.toFloat()) * effVFov
                           onManualCalibrate(dAz, dPitch)
                           invalidate()
@@ -1489,6 +1724,33 @@ jobs:
                       canvas.drawPath(path, paintHorizon)
                   }
 
+                  // Görsel Hata Denetimi: Yatay kalibrasyon yapılmışsa Ham Pusula (0° Ofset) dikey referans hattını çiz
+                  if (abs(manualAzimuthOffset) > 0.15f) {
+                      var deltaRaw = rawAzimuth - currentAzimuth
+                      if (deltaRaw > 180f) deltaRaw -= 360f
+                      if (deltaRaw < -180f) deltaRaw += 360f
+
+                      if (abs(deltaRaw) <= effHFov / 1.8f) {
+                          val rawX = cx + (deltaRaw / effHFov) * w
+                          canvas.drawLine(rawX, 155f, rawX, h - 165f, paintRawZeroLine)
+                          val labelX = (rawX + 10f).coerceAtMost(w - 280f)
+                          canvas.drawText("HAM PUSULA (0°)", labelX, cy - 90f, paintRawZeroText)
+                          canvas.drawText(
+                              String.format(Locale.US, "KAL. FARK: %+.1f°", manualAzimuthOffset),
+                              labelX,
+                              cy - 62f,
+                              paintRawZeroText
+                          )
+                      } else {
+                          canvas.drawText(
+                              String.format(Locale.US, "YATAY KAL. FARKI EKRAN DIŞI (%+.1f°)", manualAzimuthOffset),
+                              cx - 240f,
+                              cy - 95f,
+                              paintRawZeroText
+                          )
+                      }
+                  }
+
                   secondObserverRay?.let { obs2 ->
                       val meanLatRad = Math.toRadians((observerLat + obs2.lat) * 0.5)
                       val mLat = 111132.92
@@ -1536,36 +1798,55 @@ jobs:
                   canvas.drawLine(cx, cy - 65f, cx, cy - 15f, paintCrosshair)
                   canvas.drawLine(cx, cy + 15f, cx, cy + 65f, paintCrosshair)
 
+                  val lockTag = if (isHorizontalCalLocked) "KİLİTLİ" else "SERBEST"
+                  val offsetTag = if (abs(manualAzimuthOffset) > 0.1f) {
+                      String.format(Locale.US, " (%+.1f°)", manualAzimuthOffset)
+                  } else ""
+
                   val hud1 = String.format(
                       Locale.US,
-                      "AZİMUT: %.1f° | EĞİM: %.1f° | ZOOM: %.1fx | KULE RAKIM: %.0fm",
-                      currentAzimuth, currentPitch, currentZoomRatio, observerAlt
+                      "AZİMUT: %.1f°%s | EĞİM: %.1f° | ZOOM: %.1fx | KULE: %.0fm | MANYETİK: %.0fµT | YATAY: %s",
+                      currentAzimuth, offsetTag, currentPitch, currentZoomRatio, observerAlt, magneticFieldUt, lockTag
                   )
-                  canvas.drawText(hud1, 28f, 44f, paintText)
+                  canvas.drawText(hud1, 24f, 40f, paintText)
 
                   val hit = currentHit
                   if (hit != null) {
-                      val modeTag = if (hit.isTriangulated) "[KESTİRME KESİŞİM]" else "[ARAZİ ÇAKIŞTIRMA]"
+                      val modeTag = if (hit.isTriangulated) "[KESTİRME]" else "[ARAZİ]"
                       val hud2 = String.format(
                           Locale.US,
                           "%s HEDEF: %.5f, %.5f | MESAFE: %.0fm (±%.0fm) | RAKIM: %.0fm",
                           modeTag, hit.hitLat, hit.hitLon, hit.distanceMeters, hit.radialErrorMeters, hit.hitEle
                       )
                       paintText.color = Color.parseColor("#00FF66")
-                      canvas.drawText(hud2, 28f, 82f, paintText)
+                      canvas.drawText(hud2, 24f, 76f, paintText)
                       paintText.color = Color.WHITE
                   } else {
                       paintText.color = Color.YELLOW
-                      canvas.drawText("HEDEF: Nişangah 30 km içinde araziye temas etmiyor (Ufuk üstü)", 28f, 82f, paintText)
+                      canvas.drawText("HEDEF: Nişangah 30 km içinde araziye temas etmiyor (Ufuk üstü)", 24f, 76f, paintText)
                       paintText.color = Color.WHITE
                   }
 
-                  canvas.drawText("Geliştirici: Cihan Türkmen | $activeUserLabel", 28f, h - 24f, paintDevSignature)
+                  if (isMagneticAnomaly) {
+                      val bannerTop = 92f
+                      val bannerBottom = 136f
+                      canvas.drawRect(24f, bannerTop, w - 24f, bannerBottom, paintWarnBg)
+                      val warnMsg = String.format(
+                          Locale.US,
+                          "UYARI: Manyetik Parazit (%.0f µT / Beklenen %.0f µT) - Metalden uzaklaşın veya yer değiştirin!",
+                          magneticFieldUt, expectedFieldUt
+                      )
+                      canvas.drawText(warnMsg, 38f, bannerTop + 31f, paintWarnText)
+                  }
+
+                  // Geliştirici ve aktif personel imzası (alt kontrol çubuğuyla çakışmayacak güvenli yükseklikte)
+                  val sigY = max(175f, h - 148f)
+                  canvas.drawText("Geliştirici: Cihan Türkmen | $activeUserLabel", 24f, sigY, paintDevSignature)
               }
           }
           EOF
 
-          # 14. MainActivity.kt
+          # 14. MainActivity.kt (Manyetik Anomali Yönlendirmesi + Yatay Kilit + Bilinen Nokta Kalibrasyonu + İkili Güzergah KML)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/MainActivity.kt
           package tr.gov.ogm.gozetleme
 
@@ -1580,6 +1861,7 @@ jobs:
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
+          import android.text.InputType
           import android.view.Gravity
           import android.view.ScaleGestureDetector
           import android.widget.*
@@ -1603,6 +1885,8 @@ jobs:
               private lateinit var arOverlay: ArOverlayView
               private lateinit var demEngine: DemEngine
               private lateinit var sensorFusion: SensorFusion
+              private lateinit var btnLockCal: Button
+              private lateinit var btnMagStatus: Button
               private var camera: Camera? = null
 
               private var currentLat = 37.4180
@@ -1610,6 +1894,11 @@ jobs:
               private var towerHeightOffset = 12.0
               private var promptedForMissingGpsTile = false
 
+              private var anomalyStartTimeMs = 0L
+              private var lastAnomalyPromptMs = 0L
+              private var isAnomalyDialogOpen = false
+
+              private var lastRawHit: RayHitResult? = null
               private var lastProfileAzimuth = -999f
               private val bgExecutor = Executors.newSingleThreadExecutor()
               private val uiHandler = Handler(Looper.getMainLooper())
@@ -1635,8 +1924,10 @@ jobs:
                   arOverlay = ArOverlayView(this) { dAz, dPitch ->
                       sensorFusion.manualAzimuthOffset += dAz
                       sensorFusion.manualPitchOffset += dPitch
+                      arOverlay.manualAzimuthOffset = sensorFusion.manualAzimuthOffset
                   }.apply {
                       activeUserLabel = SecurityManager.getActiveUserSummary(this@MainActivity)
+                      isHorizontalCalLocked = true
                   }
                   root.addView(arOverlay, FrameLayout.LayoutParams(
                       FrameLayout.LayoutParams.MATCH_PARENT,
@@ -1663,72 +1954,126 @@ jobs:
                       true
                   }
 
+                  val btnScroll = HorizontalScrollView(this).apply {
+                      isHorizontalScrollBarEnabled = false
+                  }
+
                   val btnPanel = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
-                      setPadding(16, 16, 16, 16)
+                      setPadding(12, 12, 12, 12)
+                  }
+
+                  fun styleControlBtn(btn: Button, bgHex: String) {
+                      btn.setBackgroundColor(Color.parseColor(bgHex))
+                      btn.setTextColor(Color.WHITE)
+                      btn.textSize = 12f
+                      btn.setPadding(20, 10, 20, 10)
+                  }
+
+                  btnMagStatus = Button(this).apply {
+                      text = "Sensör: Normal"
+                      styleControlBtn(this, "#CC2E7D32")
+                      setOnClickListener { showMagneticGuidanceDialog() }
+                  }
+
+                  btnLockCal = Button(this).apply {
+                      text = "Yatay: KİLİTLİ"
+                      styleControlBtn(this, "#CC37474F")
+                      setOnClickListener { toggleHorizontalCalibrationLock() }
+                  }
+
+                  val btnRefPoint = Button(this).apply {
+                      text = "Ref. Nokta Kal."
+                      styleControlBtn(this, "#CC6A1B9A")
+                      setOnClickListener { showKnownReferenceDialog() }
                   }
 
                   val btnRegionMap = Button(this).apply {
-                      text = "Bölge Haritası İndir"
-                      setBackgroundColor(Color.parseColor("#CC1B5E20"))
-                      setTextColor(Color.WHITE)
+                      text = "Bölge İndir"
+                      styleControlBtn(this, "#CC1B5E20")
                       setOnClickListener { showRegionDownloadDialog() }
                   }
 
                   val btnTowerHeight = Button(this).apply {
                       text = "Kule +12m"
-                      setBackgroundColor(Color.parseColor("#CC263238"))
-                      setTextColor(Color.WHITE)
+                      styleControlBtn(this, "#CC263238")
                       setOnClickListener { showTowerHeightDialog(this) }
                   }
 
                   val btnSecondRay = Button(this).apply {
-                      text = "2. Kule Kodu"
-                      setBackgroundColor(Color.parseColor("#CC0277BD"))
-                      setTextColor(Color.WHITE)
+                      text = "2. Kule"
+                      styleControlBtn(this, "#CC0277BD")
                       setOnClickListener { showSecondRayDialog() }
                   }
 
                   val btnResetCal = Button(this).apply {
                       text = "Sıfırla"
-                      setBackgroundColor(Color.parseColor("#CC455A64"))
-                      setTextColor(Color.WHITE)
+                      styleControlBtn(this, "#CC455A64")
                       setOnClickListener {
                           sensorFusion.manualAzimuthOffset = 0f
                           sensorFusion.manualPitchOffset = 0f
-                          Toast.makeText(this@MainActivity, "Görsel kalibrasyon sıfırlandı", Toast.LENGTH_SHORT).show()
+                          arOverlay.manualAzimuthOffset = 0f
+                          setHorizontalLockState(true)
+                          Toast.makeText(this@MainActivity, "Kalibrasyon sıfırlandı ve yatay kilit kapatıldı", Toast.LENGTH_SHORT).show()
                       }
                   }
 
                   val btnFireKml = Button(this).apply {
                       text = "HEDEF KML ÜRET"
-                      setBackgroundColor(Color.parseColor("#FFD32F2F"))
-                      setTextColor(Color.WHITE)
+                      styleControlBtn(this, "#FFD32F2F")
                       setOnClickListener { exportAndShareKml() }
                   }
 
-                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                      setMargins(8, 0, 8, 0)
-                  }
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.WRAP_CONTENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply { setMargins(6, 0, 6, 0) }
+
+                  btnPanel.addView(btnMagStatus, lp)
+                  btnPanel.addView(btnLockCal, lp)
+                  btnPanel.addView(btnRefPoint, lp)
                   btnPanel.addView(btnRegionMap, lp)
                   btnPanel.addView(btnTowerHeight, lp)
                   btnPanel.addView(btnSecondRay, lp)
                   btnPanel.addView(btnResetCal, lp)
                   btnPanel.addView(btnFireKml, lp)
 
+                  btnScroll.addView(btnPanel)
+
                   val panelParams = FrameLayout.LayoutParams(
                       FrameLayout.LayoutParams.WRAP_CONTENT,
                       FrameLayout.LayoutParams.WRAP_CONTENT,
                       Gravity.BOTTOM or Gravity.END
                   )
-                  root.addView(btnPanel, panelParams)
+                  root.addView(btnScroll, panelParams)
 
                   setContentView(root)
 
-                  sensorFusion = SensorFusion(this) { az, pitch, _ ->
+                  sensorFusion = SensorFusion(this) { az, rawAz, pitch, fieldUt, expectedUt, isAnomaly, reason ->
                       arOverlay.currentAzimuth = az
+                      arOverlay.rawAzimuth = rawAz
+                      arOverlay.manualAzimuthOffset = sensorFusion.manualAzimuthOffset
                       arOverlay.currentPitch = pitch
+                      arOverlay.magneticFieldUt = fieldUt
+                      arOverlay.expectedFieldUt = expectedUt
+                      arOverlay.isMagneticAnomaly = isAnomaly
+                      arOverlay.anomalyReason = reason
+
+                      if (isAnomaly) {
+                          btnMagStatus.text = "PARAZİT!"
+                          btnMagStatus.setBackgroundColor(Color.parseColor("#FFD84315"))
+                          val now = System.currentTimeMillis()
+                          if (anomalyStartTimeMs == 0L) anomalyStartTimeMs = now
+                          if (!isAnomalyDialogOpen && (now - anomalyStartTimeMs > 3500L) && (now - lastAnomalyPromptMs > 60000L)) {
+                              lastAnomalyPromptMs = now
+                              showMagneticGuidanceDialog()
+                          }
+                      } else {
+                          anomalyStartTimeMs = 0L
+                          btnMagStatus.text = "Sensör: Normal"
+                          btnMagStatus.setBackgroundColor(Color.parseColor("#CC2E7D32"))
+                      }
 
                       if (abs(az - lastProfileAzimuth) > 15f) {
                           lastProfileAzimuth = az
@@ -1742,9 +2087,142 @@ jobs:
                   checkPermissionsAndStart()
               }
 
+              private fun setHorizontalLockState(locked: Boolean) {
+                  arOverlay.isHorizontalCalLocked = locked
+                  if (locked) {
+                      btnLockCal.text = "Yatay: KİLİTLİ"
+                      btnLockCal.setBackgroundColor(Color.parseColor("#CC37474F"))
+                  } else {
+                      btnLockCal.text = "Yatay: SERBEST"
+                      btnLockCal.setBackgroundColor(Color.parseColor("#CCE65100"))
+                  }
+                  arOverlay.invalidate()
+              }
+
+              private fun toggleHorizontalCalibrationLock() {
+                  if (arOverlay.isHorizontalCalLocked) {
+                      AlertDialog.Builder(this)
+                          .setTitle("Yatay Kalibrasyon Kilidini Aç")
+                          .setMessage(
+                              "Yatay kaydırma pusula yönünü doğrudan değiştirir. Yalnızca bilinen bir tepe/kule referansına hizalama yapacaksanız açmanız önerilir.\n\n" +
+                              "Ekranda turuncu kesikli çizgi ham pusula (0°) yönünü göstermeye devam edecektir."
+                          )
+                          .setPositiveButton("Kilidi Aç") { _, _ ->
+                              setHorizontalLockState(false)
+                              Toast.makeText(this, "Yatay kalibrasyon serbest bırakıldı. Hizalama bitince tekrar kilitleyin.", Toast.LENGTH_LONG).show()
+                          }
+                          .setNeutralButton("Ref. Nokta ile Hizala") { _, _ ->
+                              showKnownReferenceDialog()
+                          }
+                          .setNegativeButton("Kilitli Kalsın", null)
+                          .show()
+                  } else {
+                      setHorizontalLockState(true)
+                      Toast.makeText(this, "Yatay kalibrasyon kilitlendi.", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun showMagneticGuidanceDialog() {
+                  if (isAnomalyDialogOpen) return
+                  isAnomalyDialogOpen = true
+
+                  val isBad = arOverlay.isMagneticAnomaly
+                  val title = if (isBad) "Manyetik Parazit Tespit Edildi" else "Pusula ve Manyetik Alan Durumu"
+                  val statusLine = String.format(
+                      Locale.US,
+                      "Ölçülen Alan: %.1f µT | Beklenen Yerel Alan: %.1f µT\nDurum: %s\n\n",
+                      arOverlay.magneticFieldUt,
+                      arOverlay.expectedFieldUt,
+                      if (isBad) arOverlay.anomalyReason else "Sensör sağlıklı ve kararlı çalışıyor."
+                  )
+                  val advice = if (isBad) {
+                      "ÖNERİ 1 (En Güvenli): Kule demirlerinden, telsizden veya metal yapılardan 1.5 - 2 metre uzaklaşarak yer değiştirin.\n\n" +
+                      "ÖNERİ 2: Yer değiştiremiyorsanız bilinen bir kule/tepe üzerinden referans kalibrasyonu yapabilir veya yatay kalibrasyonu serbest bırakabilirsiniz."
+                  } else {
+                      "Pusula verisi temiz. Kazara sapmayı önlemek için yatay kalibrasyonu kilitli tutmanız önerilir."
+                  }
+
+                  AlertDialog.Builder(this)
+                      .setTitle(title)
+                      .setMessage(statusLine + advice)
+                      .setPositiveButton("Yer Değiştireceğim (Kilitli Kal)") { _, _ ->
+                          setHorizontalLockState(true)
+                      }
+                      .setNeutralButton("Ref. Nokta Kalibrasyonu") { _, _ ->
+                          showKnownReferenceDialog()
+                      }
+                      .setNegativeButton(if (arOverlay.isHorizontalCalLocked) "Yatay Kilidi Aç" else "Kapat") { _, _ ->
+                          if (arOverlay.isHorizontalCalLocked) {
+                              setHorizontalLockState(false)
+                          }
+                      }
+                      .setOnDismissListener { isAnomalyDialogOpen = false }
+                      .show()
+              }
+
+              private fun showKnownReferenceDialog() {
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(44, 24, 44, 16)
+                  }
+
+                  val info = TextView(this).apply {
+                      text = "Nişangahı bilinen bir kule veya tepeye tam hizaladıktan sonra, o noktanın koordinatlarını girin. Sistem gerçek coğrafi yönü hesaplayıp sapmayı otomatik sıfırlayacaktır."
+                      setPadding(0, 0, 0, 20)
+                  }
+
+                  val etLat = EditText(this).apply {
+                      hint = "Referans Enlem (Örn: 37.45210)"
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                  }
+                  val etLon = EditText(this).apply {
+                      hint = "Referans Boylam (Örn: 29.31050)"
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                  }
+
+                  layout.addView(info)
+                  layout.addView(etLat)
+                  layout.addView(etLon)
+
+                  AlertDialog.Builder(this)
+                      .setTitle("Bilinen Nokta / Kule Referans Kalibrasyonu")
+                      .setView(layout)
+                      .setPositiveButton("Bu Noktaya Hizala ve Kilitle") { _, _ ->
+                          val tLat = etLat.text.toString().replace(",", ".").toDoubleOrNull()
+                          val tLon = etLon.text.toString().replace(",", ".").toDoubleOrNull()
+                          if (tLat == null || tLon == null) {
+                              Toast.makeText(this, "Geçerli enlem ve boylam girin!", Toast.LENGTH_LONG).show()
+                              return@setPositiveButton
+                          }
+                          val obsAlt = demEngine.getElevation(currentLat, currentLon) + towerHeightOffset
+                          val (trueBearing, _, dist) = demEngine.calculateBearingAndPitch(
+                              currentLat, currentLon, obsAlt, tLat, tLon
+                          )
+                          if (dist < 50.0) {
+                              Toast.makeText(this, "Referans nokta bulunduğunuz konuma çok yakın!", Toast.LENGTH_LONG).show()
+                              return@setPositiveButton
+                          }
+                          val appliedOffset = sensorFusion.calibrateAzimuthToKnownBearing(trueBearing)
+                          arOverlay.manualAzimuthOffset = appliedOffset
+                          setHorizontalLockState(true)
+                          refreshHorizonAsync(trueBearing.toFloat())
+                          Toast.makeText(
+                              this,
+                              String.format(
+                                  Locale.US,
+                                  "Referans hizalandı! Gerçek yön: %.1f° | Düzeltme: %+.1f° (Kilitlendi)",
+                                  trueBearing, appliedOffset
+                              ),
+                              Toast.LENGTH_LONG
+                          ).show()
+                      }
+                      .setNegativeButton("İptal", null)
+                      .show()
+              }
+
               private fun showRegionDownloadDialog() {
                   val regionNames = ArrayList<String>()
-                  regionNames.add("📍 Otomatik: Bulunduğum GPS Konumu ve Çevresini İndir")
+                  regionNames.add("Otomatik: Bulunduğum GPS Konumu ve Yakın Sınırları İndir")
                   regionNames.addAll(demEngine.obmRegions.keys)
 
                   AlertDialog.Builder(this)
@@ -1795,8 +2273,10 @@ jobs:
               private val raycastLoop = object : Runnable {
                   override fun run() {
                       val az = arOverlay.currentAzimuth.toDouble()
+                      val rawAz = arOverlay.rawAzimuth.toDouble()
                       val pitch = arOverlay.currentPitch.toDouble()
                       val obs2 = arOverlay.secondObserverRay
+                      val hasOffset = abs(sensorFusion.manualAzimuthOffset) > 0.15f
 
                       bgExecutor.execute {
                           val terrainAlt = demEngine.getElevation(currentLat, currentLon) + towerHeightOffset
@@ -1809,11 +2289,16 @@ jobs:
                               demEngine.castRayToGround(currentLat, currentLon, terrainAlt, az, pitch)
                           }
 
+                          val rawHit = if (hasOffset) {
+                              demEngine.castRayToGround(currentLat, currentLon, terrainAlt, rawAz, pitch)
+                          } else null
+
                           uiHandler.post {
                               arOverlay.observerLat = currentLat
                               arOverlay.observerLon = currentLon
                               arOverlay.observerAlt = terrainAlt
                               arOverlay.currentHit = hit
+                              lastRawHit = rawHit
                               arOverlay.invalidate()
                           }
                       }
@@ -1835,6 +2320,7 @@ jobs:
               private fun showTowerHeightDialog(btn: Button) {
                   val input = EditText(this).apply {
                       setText(towerHeightOffset.toInt().toString())
+                      inputType = InputType.TYPE_CLASS_NUMBER
                   }
                   AlertDialog.Builder(this)
                       .setTitle("Zeminden Gözetleme Yüksekliği (Metre)")
@@ -1890,27 +2376,56 @@ jobs:
                   )
 
                   val radioCode = KmlAndCodeCodec.encodeObserverCode(packet)
-                  val kmlText = KmlAndCodeCodec.buildKmlContent(
-                      packet,
-                      arOverlay.secondObserverRay,
-                      hit,
-                      radioCode,
-                      arOverlay.activeUserLabel
-                  )
+                  val hasCalOffset = abs(sensorFusion.manualAzimuthOffset) > 0.15f
 
-                  val kmlDir = File(cacheDir, "kml")
-                  if (!kmlDir.exists()) kmlDir.mkdirs()
-                  val kmlFile = File(kmlDir, "Gozetleme_Hedef_${System.currentTimeMillis()}.kml")
-                  kmlFile.writeText(kmlText)
+                  val dialogLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(44, 24, 44, 16)
+                  }
+
+                  val summaryTv = TextView(this).apply {
+                      text = String.format(
+                          Locale.US,
+                          "Hedef Koordinatı: %.5f, %.5f\nMesafe: %d m (±%d m)\nYatay Sapma Ofseti: %+.1f°\n\nTelsiz / Diğer Kule Kestirme Kodu:\n%s",
+                          hit.hitLat, hit.hitLon,
+                          hit.distanceMeters.toInt(), hit.radialErrorMeters.toInt(),
+                          sensorFusion.manualAzimuthOffset,
+                          radioCode
+                      )
+                  }
+                  dialogLayout.addView(summaryTv)
+
+                  val cbDualPath = CheckBox(this).apply {
+                      text = "İkili Güzergah KML (Ham pusula hattını da ekle)"
+                      isChecked = true
+                  }
+                  if (hasCalOffset && lastRawHit != null) {
+                      dialogLayout.addView(cbDualPath)
+                  }
 
                   AlertDialog.Builder(this)
                       .setTitle("Hedef Oluşturuldu!")
-                      .setMessage(
-                          "Hedef Koordinatı: ${String.format(Locale.US, "%.5f, %.5f", hit.hitLat, hit.hitLon)}\n" +
-                          "Mesafe: ${hit.distanceMeters.toInt()} m (±${hit.radialErrorMeters.toInt()} m)\n\n" +
-                          "Telsiz / Diğer Kule Kestirme Kodu:\n$radioCode"
-                      )
+                      .setView(dialogLayout)
                       .setPositiveButton("KML Dosyasını Paylaş") { _, _ ->
+                          val includeDual = hasCalOffset && lastRawHit != null && cbDualPath.isChecked
+                          val kmlText = KmlAndCodeCodec.buildKmlContent(
+                              obs1 = packet,
+                              obs2 = arOverlay.secondObserverRay,
+                              hit = hit,
+                              radioCode = radioCode,
+                              operatorSummary = arOverlay.activeUserLabel,
+                              rawHitForDualPath = if (includeDual) lastRawHit else null,
+                              rawAzimuthDeg = arOverlay.rawAzimuth.toDouble(),
+                              manualAzOffsetDeg = sensorFusion.manualAzimuthOffset.toDouble(),
+                              magneticFieldUt = arOverlay.magneticFieldUt,
+                              isMagneticAnomaly = arOverlay.isMagneticAnomaly
+                          )
+
+                          val kmlDir = File(cacheDir, "kml")
+                          if (!kmlDir.exists()) kmlDir.mkdirs()
+                          val kmlFile = File(kmlDir, "Gozetleme_Hedef_${System.currentTimeMillis()}.kml")
+                          kmlFile.writeText(kmlText)
+
                           val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", kmlFile)
                           val shareIntent = Intent(Intent.ACTION_SEND).apply {
                               type = "application/vnd.google-earth.kml+xml"
