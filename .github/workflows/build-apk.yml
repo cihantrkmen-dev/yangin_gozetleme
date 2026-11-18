@@ -84,8 +84,8 @@ jobs:
                   applicationId "tr.gov.ogm.gozetleme"
                   minSdk 26
                   targetSdk 34
-                  versionCode 3
-                  versionName "1.2-SensorDecoupled"
+                  versionCode 4
+                  versionName "1.3-Stable"
               }
 
               buildTypes {
@@ -660,7 +660,7 @@ jobs:
           }
           EOF
 
-          # 9. SensorFusion.kt (DÜZELTİLDİ: Vektör tabanlı eksen ayrıştırma ile çift eksen çakışması tamamen engellendi)
+          # 9. SensorFusion.kt (Kararli ve Hatasiz Landscape Eksen Haritalama)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
           package tr.gov.ogm.gozetleme
 
@@ -670,6 +670,8 @@ jobs:
           import android.hardware.SensorEvent
           import android.hardware.SensorEventListener
           import android.hardware.SensorManager
+          import android.view.Surface
+          import android.view.WindowManager
           import kotlin.math.*
 
           class SensorFusion(
@@ -681,7 +683,8 @@ jobs:
               private val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
 
               private val rotationMatrix = FloatArray(9)
-              private val worldAxesMatrix = FloatArray(9)
+              private val remappedMatrix = FloatArray(9)
+              private val orientationAngles = FloatArray(3)
 
               var magneticDeclination: Float = 5.6f
               var manualAzimuthOffset: Float = 0f
@@ -710,36 +713,26 @@ jobs:
               override fun onSensorChanged(event: SensorEvent?) {
                   if (event?.sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
 
-                  // 1. Cihazin dondurme vektorunden rotasyon matrisini al
                   SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
 
-                  // 2. Landscape (Yatay) mod icin eksenleri dunya koordinatlarina gore dogrudan map et:
-                  // Android landscape'te arka kamera bakis yonu ve ekran duzlemi bilesenleri:
-                  SensorManager.remapCoordinateSystem(
-                      rotationMatrix,
-                      SensorManager.AXIS_Y,
-                      SensorManager.AXIS_MINUS_X,
-                      worldAxesMatrix
-                  )
+                  val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  @Suppress("DEPRECATION")
+                  val rotation = wm.defaultDisplay.rotation
 
-                  // 3. Yonelim acilarini cikar (Azimuth, Pitch, Roll)
-                  val orientation = FloatArray(3)
-                  SensorManager.getOrientation(worldAxesMatrix, orientation)
+                  when (rotation) {
+                      Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(
+                          rotationMatrix, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remappedMatrix
+                      )
+                      else -> SensorManager.remapCoordinateSystem(
+                          rotationMatrix, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remappedMatrix
+                      )
+                  }
 
-                  // 4. VEKTOR TABANLI AYRIŞTIRMA (CROSS-COUPLING FIX):
-                  // Rotasyon matrisinin 3. sutunu (veya kamera ileri vektor bilesenleri) 
-                  // dikey hareketin pusulaya sızmasını engellemek icin dogrudan normalize edilir.
-                  val camForwardX = worldAxesMatrix[2]
-                  val camForwardY = worldAxesMatrix[5]
-                  val camForwardZ = worldAxesMatrix[8]
+                  SensorManager.getOrientation(remappedMatrix, orientationAngles)
 
-                  // Yatay dulemdeki vektor acisi (Azimuth) - Sadece X ve Y bileseninden hesaplanir
-                  val rawAzRad = atan2(camForwardX.toDouble(), camForwardY.toDouble())
-                  
-                  // Dikey egitim acisi (Pitch) - Yercekimi ve Z bileseni
-                  val horizontalDist = hypot(camForwardX.toDouble(), camForwardY.toDouble())
-                  val rawPitchDeg = Math.toDegrees(atan2(camForwardZ.toDouble(), horizontalDist)).toFloat()
-                  val rawRollDeg = Math.toDegrees(orientation[2].toDouble()).toFloat()
+                  val rawAzRad = orientationAngles[0]
+                  val rawPitchDeg = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
+                  val rawRollDeg = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
 
                   smoothSinAz = smoothSinAz + alpha * (sin(rawAzRad) - smoothSinAz)
                   smoothCosAz = smoothCosAz + alpha * (cos(rawAzRad) - smoothCosAz)
@@ -895,7 +888,7 @@ jobs:
 
                       val rayPath = Path()
                       var started = false
-                      var d = 500.0
+                      val d = 500.0
                       while (d <= 30000.0) {
                           val pLat = obs2.lat + (d * cos(az2Rad)) / mLat
                           val pLon = obs2.lon + (d * sin(az2Rad)) / mLon
@@ -1315,7 +1308,7 @@ jobs:
           ls -lh
 
       - name: APK Dosyasini Derle
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleDebug --info --no-daemon
 
       - name: APK Dosyasini Indirilebilir Paket Olarak Yukle
         uses: actions/upload-artifact@v4
