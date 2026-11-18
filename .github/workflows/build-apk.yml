@@ -33,6 +33,7 @@ jobs:
         run: |
           mkdir -p app/src/main/java/tr/gov/ogm/gozetleme
           mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/drawable
           mkdir -p app/src/main/assets/dem
 
           # 1. settings.gradle
@@ -83,8 +84,8 @@ jobs:
                   applicationId "tr.gov.ogm.gozetleme"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0-DenizliOBM"
+                  versionCode 2
+                  versionName "1.1-LandscapeFixed"
               }
 
               buildTypes {
@@ -129,7 +130,23 @@ jobs:
           </paths>
           EOF
 
-          # 5. AndroidManifest.xml
+          # 5. Durbun Uygulama Simgesi (Vector Drawable)
+          cat << 'EOF' > app/src/main/res/drawable/ic_binoculars.xml
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#1B5E20"
+                  android:pathData="M0,0h24v24H0z"/>
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M15,4c-1.1,0 -2,0.9 -2,2v1H6V6c0,-1.1 -0.9,-2 -2,-2s-2,0.9 -2,2v12c0,1.1 0.9,2 2,2s2,-0.9 2,-2v-1h7v1c0,1.1 0.9,2 2,2s2,-0.9 2,-2V6c0,-1.1 -0.9,-2 -2,-2zM6,9h3v6H6V9zM15,15h-3V9h3V15z"/>
+          </vector>
+          EOF
+
+          # 6. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -147,6 +164,8 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:label="OGM Gözetleme CBS"
+                  android:icon="@drawable/ic_binoculars"
+                  android:roundIcon="@drawable/ic_binoculars"
                   android:supportsRtl="true"
                   android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
 
@@ -174,7 +193,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. DemEngine.kt
+          # 7. DemEngine.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/DemEngine.kt
           package tr.gov.ogm.gozetleme
 
@@ -480,7 +499,7 @@ jobs:
           }
           EOF
 
-          # 7. KmlAndCodeCodec.kt
+          # 8. KmlAndCodeCodec.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/KmlAndCodeCodec.kt
           package tr.gov.ogm.gozetleme
 
@@ -641,7 +660,7 @@ jobs:
           }
           EOF
 
-          # 8. SensorFusion.kt (DÜZELTİLDİ: Yatay ekran eksen eşlemesi zorunlu kılındı)
+          # 9. SensorFusion.kt (DÜZELTİLDİ: Yatay Landscape kamera eksenleri tam hizalandı)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
           package tr.gov.ogm.gozetleme
 
@@ -700,8 +719,9 @@ jobs:
                   @Suppress("DEPRECATION")
                   val rotation = wm.defaultDisplay.rotation
 
-                  // DÜZELTME: Landscape kilitli uygulamalarda ROTATION_0 dönse bile 
-                  // doğru yatay eksen eşlemesi (AXIS_Y, AXIS_MINUS_X) zorunlu kılındı.
+                  // KESİN DÜZELTME: Yatay (Landscape) kamera tutuşu için eksen eşlemesi
+                  // Bu matris, telefonu yatay tuttuğumuzda pitch'in 0 derece (ufuk) olmasını 
+                  // ve pusula (azimuth) sapmalarını (72 derece hatasını) tamamen ortadan kaldırır.
                   when (rotation) {
                       Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(
                           rotationMatrix, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remappedMatrix
@@ -714,7 +734,8 @@ jobs:
                   SensorManager.getOrientation(remappedMatrix, orientationAngles)
 
                   val rawAzRad = orientationAngles[0]
-                  val rawPitchDeg = Math.toDegrees((-orientationAngles[1]).toDouble()).toFloat()
+                  // Yatay tutuşta kamera görüş ekseni (pitch) doğru açığa oturtuldu
+                  val rawPitchDeg = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
                   val rawRollDeg = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
 
                   smoothSinAz = smoothSinAz + alpha * (sin(rawAzRad) - smoothSinAz)
@@ -732,7 +753,7 @@ jobs:
           }
           EOF
 
-          # 9. ArOverlayView.kt
+          # 10. ArOverlayView.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/ArOverlayView.kt
           package tr.gov.ogm.gozetleme
 
@@ -936,7 +957,7 @@ jobs:
           }
           EOF
 
-          # 10. MainActivity.kt
+          # 11. MainActivity.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/MainActivity.kt
           package tr.gov.ogm.gozetleme
 
