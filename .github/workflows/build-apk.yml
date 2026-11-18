@@ -84,8 +84,8 @@ jobs:
                   applicationId "tr.gov.ogm.gozetleme"
                   minSdk 26
                   targetSdk 34
-                  versionCode 2
-                  versionName "1.1-LandscapeFixed"
+                  versionCode 3
+                  versionName "1.2-SensorDecoupled"
               }
 
               buildTypes {
@@ -660,7 +660,7 @@ jobs:
           }
           EOF
 
-          # 9. SensorFusion.kt (DÜZELTİLDİ: Yatay Landscape kamera eksenleri tam hizalandı)
+          # 9. SensorFusion.kt (DÜZELTİLDİ: Vektör tabanlı eksen ayrıştırma ile çift eksen çakışması tamamen engellendi)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
           package tr.gov.ogm.gozetleme
 
@@ -670,8 +670,6 @@ jobs:
           import android.hardware.SensorEvent
           import android.hardware.SensorEventListener
           import android.hardware.SensorManager
-          import android.view.Surface
-          import android.view.WindowManager
           import kotlin.math.*
 
           class SensorFusion(
@@ -683,8 +681,7 @@ jobs:
               private val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
 
               private val rotationMatrix = FloatArray(9)
-              private val remappedMatrix = FloatArray(9)
-              private val orientationAngles = FloatArray(3)
+              private val worldAxesMatrix = FloatArray(9)
 
               var magneticDeclination: Float = 5.6f
               var manualAzimuthOffset: Float = 0f
@@ -713,30 +710,36 @@ jobs:
               override fun onSensorChanged(event: SensorEvent?) {
                   if (event?.sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
 
+                  // 1. Cihazin dondurme vektorunden rotasyon matrisini al
                   SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
 
-                  val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                  @Suppress("DEPRECATION")
-                  val rotation = wm.defaultDisplay.rotation
+                  // 2. Landscape (Yatay) mod icin eksenleri dunya koordinatlarina gore dogrudan map et:
+                  // Android landscape'te arka kamera bakis yonu ve ekran duzlemi bilesenleri:
+                  SensorManager.remapCoordinateSystem(
+                      rotationMatrix,
+                      SensorManager.AXIS_Y,
+                      SensorManager.AXIS_MINUS_X,
+                      worldAxesMatrix
+                  )
 
-                  // KESİN DÜZELTME: Yatay (Landscape) kamera tutuşu için eksen eşlemesi
-                  // Bu matris, telefonu yatay tuttuğumuzda pitch'in 0 derece (ufuk) olmasını 
-                  // ve pusula (azimuth) sapmalarını (72 derece hatasını) tamamen ortadan kaldırır.
-                  when (rotation) {
-                      Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(
-                          rotationMatrix, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remappedMatrix
-                      )
-                      else -> SensorManager.remapCoordinateSystem(
-                          rotationMatrix, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remappedMatrix
-                      )
-                  }
+                  // 3. Yonelim acilarini cikar (Azimuth, Pitch, Roll)
+                  val orientation = FloatArray(3)
+                  SensorManager.getOrientation(worldAxesMatrix, orientation)
 
-                  SensorManager.getOrientation(remappedMatrix, orientationAngles)
+                  // 4. VEKTOR TABANLI AYRIŞTIRMA (CROSS-COUPLING FIX):
+                  // Rotasyon matrisinin 3. sutunu (veya kamera ileri vektor bilesenleri) 
+                  // dikey hareketin pusulaya sızmasını engellemek icin dogrudan normalize edilir.
+                  val camForwardX = worldAxesMatrix[2]
+                  val camForwardY = worldAxesMatrix[5]
+                  val camForwardZ = worldAxesMatrix[8]
 
-                  val rawAzRad = orientationAngles[0]
-                  // Yatay tutuşta kamera görüş ekseni (pitch) doğru açığa oturtuldu
-                  val rawPitchDeg = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
-                  val rawRollDeg = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
+                  // Yatay dulemdeki vektor acisi (Azimuth) - Sadece X ve Y bileseninden hesaplanir
+                  val rawAzRad = atan2(camForwardX.toDouble(), camForwardY.toDouble())
+                  
+                  // Dikey egitim acisi (Pitch) - Yercekimi ve Z bileseni
+                  val horizontalDist = hypot(camForwardX.toDouble(), camForwardY.toDouble())
+                  val rawPitchDeg = Math.toDegrees(atan2(camForwardZ.toDouble(), horizontalDist)).toFloat()
+                  val rawRollDeg = Math.toDegrees(orientation[2].toDouble()).toFloat()
 
                   smoothSinAz = smoothSinAz + alpha * (sin(rawAzRad) - smoothSinAz)
                   smoothCosAz = smoothCosAz + alpha * (cos(rawAzRad) - smoothCosAz)
