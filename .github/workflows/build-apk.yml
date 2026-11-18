@@ -11,19 +11,21 @@ jobs:
 
     steps:
       - name: Depoyu Hazirla
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: JDK 17 Kurulumu
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Android SDK Kurulumu
-        uses: android-actions/setup-android@v3
+      - name: Android SDK Lisans ve Paket Kurulumu
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
       - name: Gradle 8.7 Kurulumu
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
@@ -53,7 +55,7 @@ jobs:
           include ':app'
           EOF
 
-          # 2.根目录 build.gradle ve gradle.properties
+          # 2. gradle.properties ve root build.gradle
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
@@ -172,7 +174,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. DemEngine.kt (Cevrimdisi SRTM Okuma, 30km Raycasting, Dunya Egriligi, Ikili Kestirme ve Izohips Motoru)
+          # 6. DemEngine.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/DemEngine.kt
           package tr.gov.ogm.gozetleme
 
@@ -203,7 +205,7 @@ jobs:
               val maxPitchDeg: Float,
               val distMeters: Float,
               val elevation: Float,
-              val contourLayers: List<Pair<Float, Float>> // Pair(pitchDeg, elevation)
+              val contourLayers: List<Pair<Float, Float>>
           )
 
           class DemEngine(private val context: Context) {
@@ -241,13 +243,12 @@ jobs:
                   }
               }
 
-              // Bilinear Enterpolasyon ile Milimetrik Yukseklik Okuma (Sifir RAM Yuku - mmap)
               fun getElevation(lat: Double, lon: Double): Double {
                   val latFloor = floor(lat).toInt()
                   val lonFloor = floor(lon).toInt()
                   val buf = getTileBuffer(latFloor, lonFloor) ?: return 0.0
 
-                  val size = sqrt((buf.limit() / 2).toDouble()).roundToInt() // 1201 (SRTM3) veya 3601 (SRTM1)
+                  val size = sqrt((buf.limit() / 2).toDouble()).roundToInt()
                   if (size < 1200) return 0.0
                   val intervals = size - 1
 
@@ -279,7 +280,6 @@ jobs:
                          h11 * du * dv
               }
 
-              // Dunya Egriligi + Atmosferik Kirilma Duzeltmeli 30 KM Raycasting
               fun castRayToGround(
                   obsLat: Double,
                   obsLon: Double,
@@ -305,20 +305,17 @@ jobs:
                       val (curLat, curLon) = projectCoordinate(obsLat, obsLon, azRad, d)
                       val rawTerrain = getElevation(curLat, curLon)
 
-                      // Dunya Egriligi ve Kirilma Duzeltmesi: d^2 / (2R) * (1 - k)
                       val curvatureDrop = (d * d) / (2.0 * earthRadius) * (1.0 - refractionK)
                       val effectiveTerrainH = rawTerrain - curvatureDrop
                       val rayH = obsAlt + d * tanPitch
 
                       if (rayH <= effectiveTerrainH) {
-                          // Tam kesisim noktasini alt-adimda bul
                           val denom = (prevRayH - prevTerrainH) - (rayH - effectiveTerrainH)
                           val frac = if (abs(denom) > 0.001) ((prevRayH - prevTerrainH) / denom).coerceIn(0.0, 1.0) else 0.5
                           val hitDist = prevDist + frac * (d - prevDist)
                           val (hitLat, hitLon) = projectCoordinate(obsLat, obsLon, azRad, hitDist)
                           val hitEle = getElevation(hitLat, hitLon)
 
-                          // Yamac egimi ve hata poligonu hesabi
                           val (aheadLat, aheadLon) = projectCoordinate(obsLat, obsLon, azRad, hitDist + 30.0)
                           val slopeRise = getElevation(aheadLat, aheadLon) - hitEle
                           val terrainSlopeRad = atan2(abs(slopeRise), 30.0)
@@ -349,12 +346,10 @@ jobs:
                   return null
               }
 
-              // Iki Gozetleme Noktasindan Kestirme (3B Skew Lines Least-Squares Intersection)
               fun triangulateTwoRays(
                   lat1: Double, lon1: Double, alt1: Double, az1Deg: Double, pitch1Deg: Double,
                   lat2: Double, lon2: Double, alt2: Double, az2Deg: Double, pitch2Deg: Double
               ): RayHitResult? {
-                  // 1. Noktayi orijin (0,0,alt1) kabul eden yerel metre (ENU) uzayina donustur
                   val meanLatRad = Math.toRadians((lat1 + lat2) * 0.5)
                   val mPerDegLat = 111132.92
                   val mPerDegLon = 111412.84 * cos(meanLatRad)
@@ -369,9 +364,8 @@ jobs:
                   val v2x = sin(az2)
                   val v2y = cos(az2)
 
-                  // 2B Yatay Kesisim Determinant (t1 ve t2 mesafeleri)
                   val det = v1x * (-v2y) - v1y * (-v2x)
-                  if (abs(det) < 1e-4) return null // Paralel bakislar
+                  if (abs(det) < 1e-4) return null
 
                   val t1 = (p2x * (-v2y) - p2y * (-v2x)) / det
                   val t2 = (v1x * p2y - v1y * p2x) / det
@@ -384,12 +378,10 @@ jobs:
                   val hitLat = lat1 + iy / mPerDegLat
                   val hitEle = getElevation(hitLat, hitLon)
 
-                  // Iki isin arasindaki kesisim acisi
                   val cosGamma = (v1x * v2x + v1y * v2y).coerceIn(-1.0, 1.0)
                   val gammaDeg = Math.toDegrees(acos(abs(cosGamma)))
                   val sinGamma = max(0.15, sin(Math.toRadians(gammaDeg)))
 
-                  // Kestirme Hata Elipsi
                   val baseErr = max(t1, t2) * tan(Math.toRadians(0.5)) / sinGamma
                   val poly = buildErrorPolygon(hitLat, hitLon, az1, baseErr, baseErr * 0.7)
 
@@ -407,7 +399,6 @@ jobs:
                   )
               }
 
-              // Kamera Acisindaki Ufuk Cizgisi ve Gorunur Es Yukselti Egrisi Noktalarini Hesapla (LOD + Occlusion Culling)
               fun buildHorizonAndContours(
                   obsLat: Double,
                   obsLon: Double,
@@ -417,7 +408,7 @@ jobs:
               ): List<HorizonProfilePoint> {
                   val results = ArrayList<HorizonProfilePoint>()
                   val halfFov = fovHorizontal / 2f
-                  val stepAz = 1.0f // Her 1 derecede bir dikey tarama
+                  val stepAz = 1.0f
 
                   var relAz = -halfFov
                   while (relAz <= halfFov) {
@@ -438,13 +429,11 @@ jobs:
                           val effEle = rawEle - drop
                           val pitch = Math.toDegrees(atan2(effEle - obsAlt, d)).toFloat()
 
-                          // Sadece ondeki tepenin arkasinda kalmayan (gorunur) yuzeyleri ciz (Occlusion Culling)
                           if (pitch > maxPitch) {
                               maxPitch = pitch
                               horizonDist = d.toFloat()
                               horizonEle = rawEle.toFloat()
 
-                              // LOD: 0-8km arasi 50m, 8-30km arasi 100m es yukselti egrisi
                               val contourInterval = if (d < 8000.0) 50 else 100
                               val currentBand = (rawEle.toInt() / contourInterval) * contourInterval
                               if (currentBand != lastContourBand && rawEle > 100) {
@@ -491,7 +480,7 @@ jobs:
           }
           EOF
 
-          # 7. KmlAndCodeCodec.kt (14 Haneli Telsiz/SMS Akilli Kodu ve Gelismis KML Uretici)
+          # 7. KmlAndCodeCodec.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/KmlAndCodeCodec.kt
           package tr.gov.ogm.gozetleme
 
@@ -509,16 +498,12 @@ jobs:
           )
 
           object KmlAndCodeCodec {
-              private const val ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTVWXYZ"
-
-              // 1. Gozetleyici Verisini Telsiz/SMS Icin Kisa Koda Sikistirir (Orn: DNZ-84A2-K91M-3C)
               fun encodeObserverCode(p: ObserverPacket): String {
-                  // Denizli ve Turkiye sinirlarina gore yuksek hassasiyetli bit paketleme (60-bit)
-                  val latInt = ((p.lat - 35.0) * 10000.0).roundToLong().coerceIn(0, 65535) // 16 bit
-                  val lonInt = ((p.lon - 25.0) * 10000.0).roundToLong().coerceIn(0, 131071) // 17 bit
-                  val altInt = p.alt.roundToLong().coerceIn(0, 4095) // 12 bit
-                  val azInt = (p.azimuth * 10.0).roundToLong().coerceIn(0, 3600) // 12 bit
-                  val pitchInt = ((p.pitch + 45.0) * 10.0).roundToLong().coerceIn(0, 900) // 10 bit
+                  val latInt = ((p.lat - 35.0) * 10000.0).roundToLong().coerceIn(0, 65535)
+                  val lonInt = ((p.lon - 25.0) * 10000.0).roundToLong().coerceIn(0, 131071)
+                  val altInt = p.alt.roundToLong().coerceIn(0, 4095)
+                  val azInt = (p.azimuth * 10.0).roundToLong().coerceIn(0, 3600)
+                  val pitchInt = ((p.pitch + 45.0) * 10.0).roundToLong().coerceIn(0, 900)
 
                   var packed = 0UL
                   packed = (packed shl 16) or latInt.toULong()
@@ -553,7 +538,6 @@ jobs:
                   }
               }
 
-              // ExtendedData, Hata Poligonu ve 3B Bakis Isini Iceren Tam KML Uretici
               fun buildKmlContent(
                   obs1: ObserverPacket,
                   obs2: ObserverPacket?,
@@ -657,7 +641,7 @@ jobs:
           }
           EOF
 
-          # 8. SensorFusion.kt (Jiroskop + Pusula Birleştirme, Manyetik Sapma Düzeltmesi ve Görsel Silüet Kalibrasyonu)
+          # 8. SensorFusion.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
           package tr.gov.ogm.gozetleme
 
@@ -683,14 +667,14 @@ jobs:
               private val remappedMatrix = FloatArray(9)
               private val orientationAngles = FloatArray(3)
 
-              var magneticDeclination: Float = 5.6f // Denizli / Türkiye varsayılan manyetik sapma (+5.6 derece)
-              var manualAzimuthOffset: Float = 0f   // Parmakla dağ silüeti kalibrasyon ofseti
+              var magneticDeclination: Float = 5.6f
+              var manualAzimuthOffset: Float = 0f
               var manualPitchOffset: Float = 0f
 
               private var smoothSinAz = 0f
               private var smoothCosAz = 1f
               private var smoothPitch = 0f
-              private val alpha = 0.15f // Titreme önleyici Alçak Geçiren Filtre katsayısı
+              private val alpha = 0.15f
 
               fun updateDeclination(lat: Double, lon: Double, alt: Double) {
                   val field = GeomagneticField(lat.toFloat(), lon.toFloat(), alt.toFloat(), System.currentTimeMillis())
@@ -712,7 +696,6 @@ jobs:
 
                   SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
 
-                  // Yatay (Landscape) kamera tutuşuna göre eksenleri yeniden eşle
                   val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
                   @Suppress("DEPRECATION")
                   val rotation = wm.defaultDisplay.rotation
@@ -735,7 +718,6 @@ jobs:
                   val rawPitchDeg = Math.toDegrees((-orientationAngles[1]).toDouble()).toFloat()
                   val rawRollDeg = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
 
-                  // Dairesel ortalama ile pusula titremesini sönümle
                   smoothSinAz = smoothSinAz + alpha * (sin(rawAzRad) - smoothSinAz)
                   smoothCosAz = smoothCosAz + alpha * (cos(rawAzRad) - smoothCosAz)
                   smoothPitch = smoothPitch + alpha * (rawPitchDeg - smoothPitch)
@@ -751,7 +733,7 @@ jobs:
           }
           EOF
 
-          # 9. ArOverlayView.kt (Eş Yükselti Eğrileri, Ufuk Çizgisi, Nişangah ve 2. Cihaz Kestirme Hattı Çizici)
+          # 9. ArOverlayView.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/ArOverlayView.kt
           package tr.gov.ogm.gozetleme
 
@@ -815,7 +797,6 @@ jobs:
               private var lastTouchX = 0f
               private var lastTouchY = 0f
 
-              // Parmakla kaydırarak AR dağ silüetini gerçek dağ sırtına oturtma (Görsel Kalibrasyon)
               override fun onTouchEvent(event: MotionEvent): Boolean {
                   when (event.actionMasked) {
                       MotionEvent.ACTION_DOWN -> {
@@ -851,7 +832,6 @@ jobs:
                   val effHFov = baseHorizontalFov / currentZoomRatio
                   val effVFov = baseVerticalFov / currentZoomRatio
 
-                  // 1. Eş Yükselti Eğrileri (İzohips) ve Ufuk Silüeti Çizimi
                   if (horizonProfile.isNotEmpty()) {
                       val path = Path()
                       var first = true
@@ -872,7 +852,6 @@ jobs:
                                   path.lineTo(x, yHorizon)
                               }
 
-                              // Alt yamaçtaki eş yükselti eğrisi noktalarını çiz
                               for (contour in pt.contourLayers) {
                                   val yContour = cy - ((contour.first - currentPitch) / effVFov) * h
                                   if (yContour in 0f..h) {
@@ -884,7 +863,6 @@ jobs:
                       canvas.drawPath(path, paintHorizon)
                   }
 
-                  // 2. İkinci Gözetleyiciden Gelen Kestirme Lazer Hattını AR Olarak Çiz
                   secondObserverRay?.let { obs2 ->
                       val meanLatRad = Math.toRadians((observerLat + obs2.lat) * 0.5)
                       val mLat = 111132.92
@@ -926,14 +904,12 @@ jobs:
                       canvas.drawPath(rayPath, paintSecondRay)
                   }
 
-                  // 3. Merkez Nişangah (Crosshair)
                   canvas.drawCircle(cx, cy, 38f, paintCrosshair)
                   canvas.drawLine(cx - 65f, cy, cx - 15f, cy, paintCrosshair)
                   canvas.drawLine(cx + 15f, cy, cx + 65f, cy, paintCrosshair)
                   canvas.drawLine(cx, cy - 65f, cx, cy - 15f, paintCrosshair)
                   canvas.drawLine(cx, cy + 15f, cx, cy + 65f, paintCrosshair)
 
-                  // 4. Üst Telemetri ve Anlık Hedef Bilgisi
                   val hud1 = String.format(
                       Locale.US,
                       "AZİMUT: %.1f° | EĞİM: %.1f° | ZOOM: %.1fx | KULE RAKIM: %.0fm",
@@ -961,7 +937,7 @@ jobs:
           }
           EOF
 
-          # 10. MainActivity.kt (Kamera, GPS, Kalibrasyon, Kule Yüksekliği ve KML/Telsiz Kodu Paylaşım Yöneticisi)
+          # 10. MainActivity.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/MainActivity.kt
           package tr.gov.ogm.gozetleme
 
@@ -1001,10 +977,9 @@ jobs:
               private lateinit var sensorFusion: SensorFusion
               private var camera: Camera? = null
 
-              // Varsayılan Konum (Denizli / Acıpayam Bölgesi - GPS kilitlenene kadar yedek)
               private var currentLat = 37.4240
               private var currentLon = 29.3520
-              private var towerHeightOffset = 12.0 // Zeminden kule yüksekliği (metre)
+              private var towerHeightOffset = 12.0
 
               private var lastProfileAzimuth = -999f
               private val bgExecutor = Executors.newSingleThreadExecutor()
@@ -1031,7 +1006,6 @@ jobs:
                       FrameLayout.LayoutParams.MATCH_PARENT
                   ))
 
-                  // Çift parmakla yakınlaştırma (Pinch-to-Zoom) + Kamera FOV senkronizasyonu
                   val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                       override fun onScale(detector: ScaleGestureDetector): Boolean {
                           val cam = camera ?: return false
@@ -1052,7 +1026,6 @@ jobs:
                       true
                   }
 
-                  // Sağ Alt Kontrol Paneli
                   val btnPanel = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
@@ -1112,7 +1085,6 @@ jobs:
                       arOverlay.currentAzimuth = az
                       arOverlay.currentPitch = pitch
 
-                      // Kamera 15 dereceden fazla döndüyse çevredeki eş yükselti eğrilerini arka planda güncelle
                       if (abs(az - lastProfileAzimuth) > 15f) {
                           lastProfileAzimuth = az
                           refreshHorizonAsync(az)
@@ -1120,7 +1092,6 @@ jobs:
                       arOverlay.invalidate()
                   }
 
-                  // İşlemciyi yormamak için Raycasting (Hedef Çakıştırma) hesabını saniyede 4 kez (250ms) çalıştır
                   uiHandler.post(raycastLoop)
 
                   checkPermissionsAndStart()
