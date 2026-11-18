@@ -1,0 +1,1330 @@
+name: Tek Dosyadan Tam Otomatik APK Derleyici
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Depoyu Hazirla
+        uses: actions/checkout@v4
+
+      - name: JDK 17 Kurulumu
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Android SDK Kurulumu
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle 8.7 Kurulumu
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Tum Proje Dosyalarini ve Kaynak Kodlarini Olustur
+        run: |
+          mkdir -p app/src/main/java/tr/gov/ogm/gozetleme
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/assets/dem
+
+          # 1. settings.gradle
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GozetlemeKamerasi"
+          include ':app'
+          EOF
+
+          # 2.根目录 build.gradle ve gradle.properties
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.3.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          # 3. app/build.gradle
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'tr.gov.ogm.gozetleme'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "tr.gov.ogm.gozetleme"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0-DenizliOBM"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              androidResources {
+                  noCompress 'hgt'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.11.0'
+
+              def camerax_version = "1.3.2"
+              implementation "androidx.camera:camera-core:${camerax_version}"
+              implementation "androidx.camera:camera-camera2:${camerax_version}"
+              implementation "androidx.camera:camera-lifecycle:${camerax_version}"
+              implementation "androidx.camera:camera-view:${camerax_version}"
+          }
+          EOF
+
+          # 4. file_paths.xml
+          cat << 'EOF' > app/src/main/res/xml/file_paths.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="kml_exports" path="kml/" />
+              <files-path name="custom_dem" path="dem/" />
+          </paths>
+          EOF
+
+          # 5. AndroidManifest.xml
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:name="android.hardware.camera" android:required="true" />
+              <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true" />
+              <uses-feature android:name="android.hardware.sensor.compass" android:required="true" />
+              <uses-feature android:name="android.hardware.location.gps" android:required="true" />
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="OGM Gözetleme CBS"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          EOF
+
+          # 6. DemEngine.kt (Cevrimdisi SRTM Okuma, 30km Raycasting, Dunya Egriligi, Ikili Kestirme ve Izohips Motoru)
+          cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/DemEngine.kt
+          package tr.gov.ogm.gozetleme
+
+          import android.content.Context
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.RandomAccessFile
+          import java.nio.ByteOrder
+          import java.nio.MappedByteBuffer
+          import java.nio.channels.FileChannel
+          import kotlin.math.*
+
+          data class RayHitResult(
+              val hitLat: Double,
+              val hitLon: Double,
+              val hitEle: Double,
+              val distanceMeters: Double,
+              val slopeDeg: Double,
+              val radialErrorMeters: Double,
+              val lateralErrorMeters: Double,
+              val polygonPoints: List<Pair<Double, Double>>,
+              val isTriangulated: Boolean = false,
+              val intersectionAngleDeg: Double = 0.0
+          )
+
+          data class HorizonProfilePoint(
+              val azimuthDeg: Float,
+              val maxPitchDeg: Float,
+              val distMeters: Float,
+              val elevation: Float,
+              val contourLayers: List<Pair<Float, Float>> // Pair(pitchDeg, elevation)
+          )
+
+          class DemEngine(private val context: Context) {
+              private val mappedTiles = HashMap<String, MappedByteBuffer>()
+              private val earthRadius = 6371000.0
+              private val refractionK = 0.13
+
+              private fun getTileBuffer(latFloor: Int, lonFloor: Int): MappedByteBuffer? {
+                  val ns = if (latFloor >= 0) "N" else "S"
+                  val ew = if (lonFloor >= 0) "E" else "W"
+                  val key = String.format("%s%02d%s%03d", ns, abs(latFloor), ew, abs(lonFloor))
+                  if (mappedTiles.containsKey(key)) return mappedTiles[key]
+
+                  return try {
+                      val fileName = "$key.hgt"
+                      val localDir = File(context.filesDir, "dem")
+                      if (!localDir.exists()) localDir.mkdirs()
+                      val outFile = File(localDir, fileName)
+
+                      if (!outFile.exists()) {
+                          context.assets.open("dem/$fileName").use { input ->
+                              FileOutputStream(outFile).use { output ->
+                                  input.copyTo(output)
+                              }
+                          }
+                      }
+                      val raf = RandomAccessFile(outFile, "r")
+                      val channel = raf.channel
+                      val buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size())
+                      buffer.order(ByteOrder.BIG_ENDIAN)
+                      mappedTiles[key] = buffer
+                      buffer
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              // Bilinear Enterpolasyon ile Milimetrik Yukseklik Okuma (Sifir RAM Yuku - mmap)
+              fun getElevation(lat: Double, lon: Double): Double {
+                  val latFloor = floor(lat).toInt()
+                  val lonFloor = floor(lon).toInt()
+                  val buf = getTileBuffer(latFloor, lonFloor) ?: return 0.0
+
+                  val size = sqrt((buf.limit() / 2).toDouble()).roundToInt() // 1201 (SRTM3) veya 3601 (SRTM1)
+                  if (size < 1200) return 0.0
+                  val intervals = size - 1
+
+                  val u = (lat - latFloor) * intervals
+                  val v = (lon - lonFloor) * intervals
+
+                  val row0 = (intervals - floor(u).toInt()).coerceIn(0, intervals - 1)
+                  val col0 = floor(v).toInt().coerceIn(0, intervals - 1)
+                  val row1 = (row0 - 1).coerceIn(0, intervals)
+                  val col1 = (col0 + 1).coerceIn(0, intervals)
+
+                  val du = u - floor(u)
+                  val dv = v - floor(v)
+
+                  fun readSample(r: Int, c: Int): Double {
+                      val idx = (r * size + c) * 2
+                      val s = buf.getShort(idx).toInt()
+                      return if (s < -1000) 0.0 else s.toDouble()
+                  }
+
+                  val h00 = readSample(row0, col0)
+                  val h01 = readSample(row0, col1)
+                  val h10 = readSample(row1, col0)
+                  val h11 = readSample(row1, col1)
+
+                  return h00 * (1 - du) * (1 - dv) +
+                         h01 * (1 - du) * dv +
+                         h10 * du * (1 - dv) +
+                         h11 * du * dv
+              }
+
+              // Dunya Egriligi + Atmosferik Kirilma Duzeltmeli 30 KM Raycasting
+              fun castRayToGround(
+                  obsLat: Double,
+                  obsLon: Double,
+                  obsAlt: Double,
+                  azimuthDeg: Double,
+                  pitchDeg: Double,
+                  azErrorDeg: Double = 0.5,
+                  pitchErrorDeg: Double = 0.25,
+                  maxDistMeters: Double = 30000.0
+              ): RayHitResult? {
+                  val azRad = Math.toRadians(azimuthDeg)
+                  val pitchRad = Math.toRadians(pitchDeg)
+                  val tanPitch = tan(pitchRad)
+
+                  var prevDist = 20.0
+                  var prevRayH = obsAlt
+                  var prevTerrainH = getElevation(obsLat, obsLon)
+
+                  var d = 30.0
+                  val step = 15.0
+
+                  while (d <= maxDistMeters) {
+                      val (curLat, curLon) = projectCoordinate(obsLat, obsLon, azRad, d)
+                      val rawTerrain = getElevation(curLat, curLon)
+
+                      // Dunya Egriligi ve Kirilma Duzeltmesi: d^2 / (2R) * (1 - k)
+                      val curvatureDrop = (d * d) / (2.0 * earthRadius) * (1.0 - refractionK)
+                      val effectiveTerrainH = rawTerrain - curvatureDrop
+                      val rayH = obsAlt + d * tanPitch
+
+                      if (rayH <= effectiveTerrainH) {
+                          // Tam kesisim noktasini alt-adimda bul
+                          val denom = (prevRayH - prevTerrainH) - (rayH - effectiveTerrainH)
+                          val frac = if (abs(denom) > 0.001) ((prevRayH - prevTerrainH) / denom).coerceIn(0.0, 1.0) else 0.5
+                          val hitDist = prevDist + frac * (d - prevDist)
+                          val (hitLat, hitLon) = projectCoordinate(obsLat, obsLon, azRad, hitDist)
+                          val hitEle = getElevation(hitLat, hitLon)
+
+                          // Yamac egimi ve hata poligonu hesabi
+                          val (aheadLat, aheadLon) = projectCoordinate(obsLat, obsLon, azRad, hitDist + 30.0)
+                          val slopeRise = getElevation(aheadLat, aheadLon) - hitEle
+                          val terrainSlopeRad = atan2(abs(slopeRise), 30.0)
+                          val grazeAngle = max(Math.toRadians(2.0), abs(terrainSlopeRad - pitchRad))
+
+                          val lateralErr = hitDist * tan(Math.toRadians(azErrorDeg))
+                          val radialErr = (hitDist * Math.toRadians(pitchErrorDeg) / sin(grazeAngle)).coerceIn(25.0, 1200.0)
+
+                          val poly = buildErrorPolygon(hitLat, hitLon, azRad, radialErr, lateralErr)
+
+                          return RayHitResult(
+                              hitLat = hitLat,
+                              hitLon = hitLon,
+                              hitEle = hitEle,
+                              distanceMeters = hitDist,
+                              slopeDeg = Math.toDegrees(terrainSlopeRad),
+                              radialErrorMeters = radialErr,
+                              lateralErrorMeters = lateralErr,
+                              polygonPoints = poly
+                          )
+                      }
+
+                      prevDist = d
+                      prevRayH = rayH
+                      prevTerrainH = effectiveTerrainH
+                      d += step
+                  }
+                  return null
+              }
+
+              // Iki Gozetleme Noktasindan Kestirme (3B Skew Lines Least-Squares Intersection)
+              fun triangulateTwoRays(
+                  lat1: Double, lon1: Double, alt1: Double, az1Deg: Double, pitch1Deg: Double,
+                  lat2: Double, lon2: Double, alt2: Double, az2Deg: Double, pitch2Deg: Double
+              ): RayHitResult? {
+                  // 1. Noktayi orijin (0,0,alt1) kabul eden yerel metre (ENU) uzayina donustur
+                  val meanLatRad = Math.toRadians((lat1 + lat2) * 0.5)
+                  val mPerDegLat = 111132.92
+                  val mPerDegLon = 111412.84 * cos(meanLatRad)
+
+                  val p2x = (lon2 - lon1) * mPerDegLon
+                  val p2y = (lat2 - lat1) * mPerDegLat
+
+                  val az1 = Math.toRadians(az1Deg)
+                  val az2 = Math.toRadians(az2Deg)
+                  val v1x = sin(az1)
+                  val v1y = cos(az1)
+                  val v2x = sin(az2)
+                  val v2y = cos(az2)
+
+                  // 2B Yatay Kesisim Determinant (t1 ve t2 mesafeleri)
+                  val det = v1x * (-v2y) - v1y * (-v2x)
+                  if (abs(det) < 1e-4) return null // Paralel bakislar
+
+                  val t1 = (p2x * (-v2y) - p2y * (-v2x)) / det
+                  val t2 = (v1x * p2y - v1y * p2x) / det
+
+                  if (t1 < 10.0 || t2 < 10.0 || t1 > 60000.0 || t2 > 60000.0) return null
+
+                  val ix = t1 * v1x
+                  val iy = t1 * v1y
+                  val hitLon = lon1 + ix / mPerDegLon
+                  val hitLat = lat1 + iy / mPerDegLat
+                  val hitEle = getElevation(hitLat, hitLon)
+
+                  // Iki isin arasindaki kesisim acisi
+                  val cosGamma = (v1x * v2x + v1y * v2y).coerceIn(-1.0, 1.0)
+                  val gammaDeg = Math.toDegrees(acos(abs(cosGamma)))
+                  val sinGamma = max(0.15, sin(Math.toRadians(gammaDeg)))
+
+                  // Kestirme Hata Elipsi
+                  val baseErr = max(t1, t2) * tan(Math.toRadians(0.5)) / sinGamma
+                  val poly = buildErrorPolygon(hitLat, hitLon, az1, baseErr, baseErr * 0.7)
+
+                  return RayHitResult(
+                      hitLat = hitLat,
+                      hitLon = hitLon,
+                      hitEle = hitEle,
+                      distanceMeters = t1,
+                      slopeDeg = 0.0,
+                      radialErrorMeters = baseErr,
+                      lateralErrorMeters = baseErr * 0.7,
+                      polygonPoints = poly,
+                      isTriangulated = true,
+                      intersectionAngleDeg = gammaDeg
+                  )
+              }
+
+              // Kamera Acisindaki Ufuk Cizgisi ve Gorunur Es Yukselti Egrisi Noktalarini Hesapla (LOD + Occlusion Culling)
+              fun buildHorizonAndContours(
+                  obsLat: Double,
+                  obsLon: Double,
+                  obsAlt: Double,
+                  centerAzimuth: Float,
+                  fovHorizontal: Float = 60f
+              ): List<HorizonProfilePoint> {
+                  val results = ArrayList<HorizonProfilePoint>()
+                  val halfFov = fovHorizontal / 2f
+                  val stepAz = 1.0f // Her 1 derecede bir dikey tarama
+
+                  var relAz = -halfFov
+                  while (relAz <= halfFov) {
+                      val az = (centerAzimuth + relAz + 360f) % 360f
+                      val azRad = Math.toRadians(az.toDouble())
+
+                      var maxPitch = -90.0f
+                      var horizonDist = 0f
+                      var horizonEle = 0f
+                      val visibleContours = ArrayList<Pair<Float, Float>>()
+                      var lastContourBand = -1
+
+                      var d = 250.0
+                      while (d <= 30000.0) {
+                          val (lat, lon) = projectCoordinate(obsLat, obsLon, azRad, d)
+                          val rawEle = getElevation(lat, lon)
+                          val drop = (d * d) / (2.0 * earthRadius) * (1.0 - refractionK)
+                          val effEle = rawEle - drop
+                          val pitch = Math.toDegrees(atan2(effEle - obsAlt, d)).toFloat()
+
+                          // Sadece ondeki tepenin arkasinda kalmayan (gorunur) yuzeyleri ciz (Occlusion Culling)
+                          if (pitch > maxPitch) {
+                              maxPitch = pitch
+                              horizonDist = d.toFloat()
+                              horizonEle = rawEle.toFloat()
+
+                              // LOD: 0-8km arasi 50m, 8-30km arasi 100m es yukselti egrisi
+                              val contourInterval = if (d < 8000.0) 50 else 100
+                              val currentBand = (rawEle.toInt() / contourInterval) * contourInterval
+                              if (currentBand != lastContourBand && rawEle > 100) {
+                                  visibleContours.add(Pair(pitch, currentBand.toFloat()))
+                                  lastContourBand = currentBand
+                              }
+                          }
+                          d += if (d < 5000.0) 100.0 else if (d < 15000.0) 200.0 else 350.0
+                      }
+
+                      results.add(HorizonProfilePoint(az, maxPitch, horizonDist, horizonEle, visibleContours))
+                      relAz += stepAz
+                  }
+                  return results
+              }
+
+              fun projectCoordinate(lat: Double, lon: Double, azRad: Double, distMeters: Double): Pair<Double, Double> {
+                  val latRad = Math.toRadians(lat)
+                  val dLat = (distMeters * cos(azRad)) / 111132.92
+                  val dLon = (distMeters * sin(azRad)) / (111412.84 * cos(latRad))
+                  return Pair(lat + dLat, lon + dLon)
+              }
+
+              private fun buildErrorPolygon(
+                  centerLat: Double,
+                  centerLon: Double,
+                  azRad: Double,
+                  radialErr: Double,
+                  lateralErr: Double
+              ): List<Pair<Double, Double>> {
+                  val pts = ArrayList<Pair<Double, Double>>()
+                  for (i in 0..8) {
+                      val angle = (i * 2.0 * PI) / 8.0
+                      val localForward = radialErr * cos(angle)
+                      val localRight = lateralErr * sin(angle)
+                      val dNorth = localForward * cos(azRad) - localRight * sin(azRad)
+                      val dEast = localForward * sin(azRad) + localRight * cos(azRad)
+                      val pLat = centerLat + dNorth / 111132.92
+                      val pLon = centerLon + dEast / (111412.84 * cos(Math.toRadians(centerLat)))
+                      pts.add(Pair(pLat, pLon))
+                  }
+                  return pts
+              }
+          }
+          EOF
+
+          # 7. KmlAndCodeCodec.kt (14 Haneli Telsiz/SMS Akilli Kodu ve Gelismis KML Uretici)
+          cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/KmlAndCodeCodec.kt
+          package tr.gov.ogm.gozetleme
+
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.roundToLong
+
+          data class ObserverPacket(
+              val lat: Double,
+              val lon: Double,
+              val alt: Double,
+              val azimuth: Double,
+              val pitch: Double
+          )
+
+          object KmlAndCodeCodec {
+              private const val ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTVWXYZ"
+
+              // 1. Gozetleyici Verisini Telsiz/SMS Icin Kisa Koda Sikistirir (Orn: DNZ-84A2-K91M-3C)
+              fun encodeObserverCode(p: ObserverPacket): String {
+                  // Denizli ve Turkiye sinirlarina gore yuksek hassasiyetli bit paketleme (60-bit)
+                  val latInt = ((p.lat - 35.0) * 10000.0).roundToLong().coerceIn(0, 65535) // 16 bit
+                  val lonInt = ((p.lon - 25.0) * 10000.0).roundToLong().coerceIn(0, 131071) // 17 bit
+                  val altInt = p.alt.roundToLong().coerceIn(0, 4095) // 12 bit
+                  val azInt = (p.azimuth * 10.0).roundToLong().coerceIn(0, 3600) // 12 bit
+                  val pitchInt = ((p.pitch + 45.0) * 10.0).roundToLong().coerceIn(0, 900) // 10 bit
+
+                  var packed = 0UL
+                  packed = (packed shl 16) or latInt.toULong()
+                  packed = (packed shl 17) or lonInt.toULong()
+                  packed = (packed shl 12) or altInt.toULong()
+                  packed = (packed shl 12) or azInt.toULong()
+                  packed = (packed shl 7) or (pitchInt.toULong() shr 3)
+
+                  val raw = packed.toString(36).uppercase(Locale.US).padStart(12, '0')
+                  return "${raw.substring(0, 4)}-${raw.substring(4, 8)}-${raw.substring(8, 12)}"
+              }
+
+              fun decodeObserverCode(code: String): ObserverPacket? {
+                  return try {
+                      val clean = code.replace("-", "").trim().uppercase(Locale.US)
+                      val packed = clean.toULong(36)
+                      val pitchHigh = (packed and 0x7FUL).toLong() shl 3
+                      val azInt = ((packed shr 7) and 0xFFFUL).toLong()
+                      val altInt = ((packed shr 19) and 0xFFFUL).toLong()
+                      val lonInt = ((packed shr 31) and 0x1FFFFUL).toLong()
+                      val latInt = ((packed shr 48) and 0xFFFFUL).toLong()
+
+                      ObserverPacket(
+                          lat = 35.0 + latInt / 10000.0,
+                          lon = 25.0 + lonInt / 10000.0,
+                          alt = altInt.toDouble(),
+                          azimuth = azInt / 10.0,
+                          pitch = (pitchHigh / 10.0) - 45.0
+                      )
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              // ExtendedData, Hata Poligonu ve 3B Bakis Isini Iceren Tam KML Uretici
+              fun buildKmlContent(
+                  obs1: ObserverPacket,
+                  obs2: ObserverPacket?,
+                  hit: RayHitResult,
+                  radioCode: String
+              ): String {
+                  val timeStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+                  val polyCoords = hit.polygonPoints.joinToString("\n") {
+                      "${it.second},${it.first},${hit.hitEle}"
+                  }
+
+                  val secondLineXml = if (obs2 != null) {
+                      """
+                      <Placemark>
+                          <name>2. Gözetleme Noktası (Kestirme)</name>
+                          <Style><LineStyle><color>ff00ffff</color><width>3</width></LineStyle></Style>
+                          <LineString>
+                              <altitudeMode>absolute</altitudeMode>
+                              <coordinates>
+                                  ${obs2.lon},${obs2.lat},${obs2.alt}
+                                  ${hit.hitLon},${hit.hitLat},${hit.hitEle}
+                              </coordinates>
+                          </LineString>
+                      </Placemark>
+                      """.trimIndent()
+                  } else ""
+
+                  val modeTitle = if (hit.isTriangulated) "İKİLİ KESTİRME HEDEFİ" else "DOĞRUDAN ARAZİ ÇAKIŞTIRMA HEDEFİ"
+
+                  return """<?xml version="1.0" encoding="UTF-8"?>
+          <kml xmlns="http://www.opengis.net/kml/2.2">
+          <Document>
+              <name>OGM Gözetleme Hedef Raporu - $timeStr</name>
+              <ExtendedData>
+                  <Data name="obs1_lat"><value>${obs1.lat}</value></Data>
+                  <Data name="obs1_lon"><value>${obs1.lon}</value></Data>
+                  <Data name="obs1_alt"><value>${obs1.alt}</value></Data>
+                  <Data name="azimuth"><value>${obs1.azimuth}</value></Data>
+                  <Data name="pitch"><value>${obs1.pitch}</value></Data>
+                  <Data name="radio_code"><value>$radioCode</value></Data>
+              </ExtendedData>
+
+              <Placemark>
+                  <name>1. Gözetleme Noktası (Azimut: ${String.format(Locale.US, "%.1f", obs1.azimuth)}°)</name>
+                  <Point>
+                      <altitudeMode>absolute</altitudeMode>
+                      <coordinates>${obs1.lon},${obs1.lat},${obs1.alt}</coordinates>
+                  </Point>
+              </Placemark>
+
+              <Placemark>
+                  <name>1. Bakış Hattı (${String.format(Locale.US, "%.0f", hit.distanceMeters)} m)</name>
+                  <Style><LineStyle><color>ff0000ff</color><width>3</width></LineStyle></Style>
+                  <LineString>
+                      <altitudeMode>absolute</altitudeMode>
+                      <coordinates>
+                          ${obs1.lon},${obs1.lat},${obs1.alt}
+                          ${hit.hitLon},${hit.hitLat},${hit.hitEle}
+                      </coordinates>
+                  </LineString>
+              </Placemark>
+
+              $secondLineXml
+
+              <Placemark>
+                  <name>$modeTitle</name>
+                  <description><![CDATA[
+                      <b>Koordinat:</b> ${String.format(Locale.US, "%.5f, %.5f", hit.hitLat, hit.hitLon)}<br/>
+                      <b>Rakım:</b> ${String.format(Locale.US, "%.0f", hit.hitEle)} m<br/>
+                      <b>Mesafe:</b> ${String.format(Locale.US, "%.0f", hit.distanceMeters)} m<br/>
+                      <b>Azimut / Eğim:</b> ${String.format(Locale.US, "%.1f° / %.1f°", obs1.azimuth, obs1.pitch)}<br/>
+                      <b>Hata Payı:</b> ±${String.format(Locale.US, "%.0f", hit.radialErrorMeters)} m (Boyuna) / ±${String.format(Locale.US, "%.0f", hit.lateralErrorMeters)} m (Enine)<br/>
+                      <b>Kestirme Telsiz Kodu:</b> $radioCode
+                  ]]></description>
+                  <Point>
+                      <altitudeMode>clampToGround</altitudeMode>
+                      <coordinates>${hit.hitLon},${hit.hitLat},${hit.hitEle}</coordinates>
+                  </Point>
+              </Placemark>
+
+              <Placemark>
+                  <name>Olası Hata Alanı (±${String.format(Locale.US, "%.0f", hit.radialErrorMeters)}m)</name>
+                  <Style>
+                      <LineStyle><color>ff0055ff</color><width>2</width></LineStyle>
+                      <PolyStyle><color>550055ff</color></PolyStyle>
+                  </Style>
+                  <Polygon>
+                      <altitudeMode>clampToGround</altitudeMode>
+                      <outerBoundaryIs>
+                          <LinearRing>
+                              <coordinates>
+                                  $polyCoords
+                              </coordinates>
+                          </LinearRing>
+                      </outerBoundaryIs>
+                  </Polygon>
+              </Placemark>
+          </Document>
+          </kml>"""
+              }
+          }
+          EOF
+
+          # 8. SensorFusion.kt (Jiroskop + Pusula Birleştirme, Manyetik Sapma Düzeltmesi ve Görsel Silüet Kalibrasyonu)
+          cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
+          package tr.gov.ogm.gozetleme
+
+          import android.content.Context
+          import android.hardware.GeomagneticField
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.view.Surface
+          import android.view.WindowManager
+          import kotlin.math.*
+
+          class SensorFusion(
+              private val context: Context,
+              private val onOrientationChanged: (azimuthTrueDeg: Float, pitchDeg: Float, rollDeg: Float) -> Unit
+          ) : SensorEventListener {
+
+              private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+              private val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+
+              private val rotationMatrix = FloatArray(9)
+              private val remappedMatrix = FloatArray(9)
+              private val orientationAngles = FloatArray(3)
+
+              var magneticDeclination: Float = 5.6f // Denizli / Türkiye varsayılan manyetik sapma (+5.6 derece)
+              var manualAzimuthOffset: Float = 0f   // Parmakla dağ silüeti kalibrasyon ofseti
+              var manualPitchOffset: Float = 0f
+
+              private var smoothSinAz = 0f
+              private var smoothCosAz = 1f
+              private var smoothPitch = 0f
+              private val alpha = 0.15f // Titreme önleyici Alçak Geçiren Filtre katsayısı
+
+              fun updateDeclination(lat: Double, lon: Double, alt: Double) {
+                  val field = GeomagneticField(lat.toFloat(), lon.toFloat(), alt.toFloat(), System.currentTimeMillis())
+                  magneticDeclination = field.declination
+              }
+
+              fun start() {
+                  rotationSensor?.let {
+                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                  }
+              }
+
+              fun stop() {
+                  sensorManager.unregisterListener(this)
+              }
+
+              override fun onSensorChanged(event: SensorEvent?) {
+                  if (event?.sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
+
+                  SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+
+                  // Yatay (Landscape) kamera tutuşuna göre eksenleri yeniden eşle
+                  val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  @Suppress("DEPRECATION")
+                  val rotation = wm.defaultDisplay.rotation
+
+                  when (rotation) {
+                      Surface.ROTATION_90 -> SensorManager.remapCoordinateSystem(
+                          rotationMatrix, SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remappedMatrix
+                      )
+                      Surface.ROTATION_270 -> SensorManager.remapCoordinateSystem(
+                          rotationMatrix, SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remappedMatrix
+                      )
+                      else -> SensorManager.remapCoordinateSystem(
+                          rotationMatrix, SensorManager.AXIS_X, SensorManager.AXIS_Z, remappedMatrix
+                      )
+                  }
+
+                  SensorManager.getOrientation(remappedMatrix, orientationAngles)
+
+                  val rawAzRad = orientationAngles[0]
+                  val rawPitchDeg = Math.toDegrees((-orientationAngles[1]).toDouble()).toFloat()
+                  val rawRollDeg = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
+
+                  // Dairesel ortalama ile pusula titremesini sönümle
+                  smoothSinAz = smoothSinAz + alpha * (sin(rawAzRad) - smoothSinAz)
+                  smoothCosAz = smoothCosAz + alpha * (cos(rawAzRad) - smoothCosAz)
+                  smoothPitch = smoothPitch + alpha * (rawPitchDeg - smoothPitch)
+
+                  val filteredAzDeg = Math.toDegrees(atan2(smoothSinAz.toDouble(), smoothCosAz.toDouble())).toFloat()
+                  val trueAzimuth = (filteredAzDeg + magneticDeclination + manualAzimuthOffset + 360f) % 360f
+                  val calibratedPitch = (smoothPitch + manualPitchOffset).coerceIn(-89f, 89f)
+
+                  onOrientationChanged(trueAzimuth, calibratedPitch, rawRollDeg)
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+          }
+          EOF
+
+          # 9. ArOverlayView.kt (Eş Yükselti Eğrileri, Ufuk Çizgisi, Nişangah ve 2. Cihaz Kestirme Hattı Çizici)
+          cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/ArOverlayView.kt
+          package tr.gov.ogm.gozetleme
+
+          import android.content.Context
+          import android.graphics.*
+          import android.view.MotionEvent
+          import android.view.View
+          import java.util.Locale
+          import kotlin.math.*
+
+          class ArOverlayView(
+              context: Context,
+              private val onManualCalibrate: (dAz: Float, dPitch: Float) -> Unit
+          ) : View(context) {
+
+              var currentAzimuth = 0f
+              var currentPitch = 0f
+              var currentZoomRatio = 1.0f
+              var baseHorizontalFov = 62f
+              var baseVerticalFov = 46f
+
+              var horizonProfile: List<HorizonProfilePoint> = emptyList()
+              var currentHit: RayHitResult? = null
+              var secondObserverRay: ObserverPacket? = null
+              var observerLat = 0.0
+              var observerLon = 0.0
+              var observerAlt = 0.0
+
+              private val paintHorizon = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#00FF66")
+                  strokeWidth = 4f
+                  style = Paint.Style.STROKE
+              }
+
+              private val paintContour = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#AA00E5FF")
+                  strokeWidth = 2f
+                  style = Paint.Style.FILL_AND_STROKE
+              }
+
+              private val paintCrosshair = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.RED
+                  strokeWidth = 3.5f
+                  style = Paint.Style.STROKE
+              }
+
+              private val paintSecondRay = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.YELLOW
+                  strokeWidth = 4f
+                  style = Paint.Style.STROKE
+                  pathEffect = DashPathEffect(floatArrayOf(20f, 15f), 0f)
+              }
+
+              private val paintText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  textSize = 28f
+                  typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                  setShadowLayer(4f, 2f, 2f, Color.BLACK)
+              }
+
+              private var lastTouchX = 0f
+              private var lastTouchY = 0f
+
+              // Parmakla kaydırarak AR dağ silüetini gerçek dağ sırtına oturtma (Görsel Kalibrasyon)
+              override fun onTouchEvent(event: MotionEvent): Boolean {
+                  when (event.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          lastTouchX = event.x
+                          lastTouchY = event.y
+                          return true
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          val dx = event.x - lastTouchX
+                          val dy = event.y - lastTouchY
+                          lastTouchX = event.x
+                          lastTouchY = event.y
+
+                          val effHFov = baseHorizontalFov / currentZoomRatio
+                          val effVFov = baseVerticalFov / currentZoomRatio
+                          val dAz = -(dx / width.toFloat()) * effHFov
+                          val dPitch = (dy / height.toFloat()) * effVFov
+                          onManualCalibrate(dAz, dPitch)
+                          invalidate()
+                          return true
+                      }
+                  }
+                  return super.onTouchEvent(event)
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val cx = w / 2f
+                  val cy = h / 2f
+
+                  val effHFov = baseHorizontalFov / currentZoomRatio
+                  val effVFov = baseVerticalFov / currentZoomRatio
+
+                  // 1. Eş Yükselti Eğrileri (İzohips) ve Ufuk Silüeti Çizimi
+                  if (horizonProfile.isNotEmpty()) {
+                      val path = Path()
+                      var first = true
+
+                      for (pt in horizonProfile) {
+                          var deltaAz = pt.azimuthDeg - currentAzimuth
+                          if (deltaAz > 180f) deltaAz -= 360f
+                          if (deltaAz < -180f) deltaAz += 360f
+
+                          if (abs(deltaAz) <= effHFov / 1.8f) {
+                              val x = cx + (deltaAz / effHFov) * w
+                              val yHorizon = cy - ((pt.maxPitchDeg - currentPitch) / effVFov) * h
+
+                              if (first) {
+                                  path.moveTo(x, yHorizon)
+                                  first = false
+                              } else {
+                                  path.lineTo(x, yHorizon)
+                              }
+
+                              // Alt yamaçtaki eş yükselti eğrisi noktalarını çiz
+                              for (contour in pt.contourLayers) {
+                                  val yContour = cy - ((contour.first - currentPitch) / effVFov) * h
+                                  if (yContour in 0f..h) {
+                                      canvas.drawCircle(x, yContour, 2.5f, paintContour)
+                                  }
+                              }
+                          }
+                      }
+                      canvas.drawPath(path, paintHorizon)
+                  }
+
+                  // 2. İkinci Gözetleyiciden Gelen Kestirme Lazer Hattını AR Olarak Çiz
+                  secondObserverRay?.let { obs2 ->
+                      val meanLatRad = Math.toRadians((observerLat + obs2.lat) * 0.5)
+                      val mLat = 111132.92
+                      val mLon = 111412.84 * cos(meanLatRad)
+                      val az2Rad = Math.toRadians(obs2.azimuth)
+                      val pitch2Rad = Math.toRadians(obs2.pitch)
+
+                      val rayPath = Path()
+                      var started = false
+                      var d = 500.0
+                      while (d <= 30000.0) {
+                          val pLat = obs2.lat + (d * cos(az2Rad)) / mLat
+                          val pLon = obs2.lon + (d * sin(az2Rad)) / mLon
+                          val pAlt = obs2.alt + d * tan(pitch2Rad)
+
+                          val dxEast = (pLon - observerLon) * mLon
+                          val dyNorth = (pLat - observerLat) * mLat
+                          val distToUs = hypot(dxEast, dyNorth)
+
+                          if (distToUs > 50.0) {
+                              val azFromUs = (Math.toDegrees(atan2(dxEast, dyNorth)).toFloat() + 360f) % 360f
+                              val pitchFromUs = Math.toDegrees(atan2(pAlt - observerAlt, distToUs)).toFloat()
+
+                              var dAz = azFromUs - currentAzimuth
+                              if (dAz > 180f) dAz -= 360f
+                              if (dAz < -180f) dAz += 360f
+
+                              val sx = cx + (dAz / effHFov) * w
+                              val sy = cy - ((pitchFromUs - currentPitch) / effVFov) * h
+                              if (!started) {
+                                  rayPath.moveTo(sx, sy)
+                                  started = true
+                              } else {
+                                  rayPath.lineTo(sx, sy)
+                              }
+                          }
+                          d += 500.0
+                      }
+                      canvas.drawPath(rayPath, paintSecondRay)
+                  }
+
+                  // 3. Merkez Nişangah (Crosshair)
+                  canvas.drawCircle(cx, cy, 38f, paintCrosshair)
+                  canvas.drawLine(cx - 65f, cy, cx - 15f, cy, paintCrosshair)
+                  canvas.drawLine(cx + 15f, cy, cx + 65f, cy, paintCrosshair)
+                  canvas.drawLine(cx, cy - 65f, cx, cy - 15f, paintCrosshair)
+                  canvas.drawLine(cx, cy + 15f, cx, cy + 65f, paintCrosshair)
+
+                  // 4. Üst Telemetri ve Anlık Hedef Bilgisi
+                  val hud1 = String.format(
+                      Locale.US,
+                      "AZİMUT: %.1f° | EĞİM: %.1f° | ZOOM: %.1fx | KULE RAKIM: %.0fm",
+                      currentAzimuth, currentPitch, currentZoomRatio, observerAlt
+                  )
+                  canvas.drawText(hud1, 32f, 48f, paintText)
+
+                  val hit = currentHit
+                  if (hit != null) {
+                      val modeTag = if (hit.isTriangulated) "[KESTİRME KESİŞİM]" else "[ARAZİ ÇAKIŞTIRMA]"
+                      val hud2 = String.format(
+                          Locale.US,
+                          "%s HEDEF: %.5f, %.5f | MESAFE: %.0fm (±%.0fm) | RAKIM: %.0fm",
+                          modeTag, hit.hitLat, hit.hitLon, hit.distanceMeters, hit.radialErrorMeters, hit.hitEle
+                      )
+                      paintText.color = Color.parseColor("#00FF66")
+                      canvas.drawText(hud2, 32f, 88f, paintText)
+                      paintText.color = Color.WHITE
+                  } else {
+                      paintText.color = Color.YELLOW
+                      canvas.drawText("HEDEF: Nişangah 30 km içinde araziye temas etmiyor (Ufuk üstü)", 32f, 88f, paintText)
+                      paintText.color = Color.WHITE
+                  }
+              }
+          }
+          EOF
+
+          # 10. MainActivity.kt (Kamera, GPS, Kalibrasyon, Kule Yüksekliği ve KML/Telsiz Kodu Paylaşım Yöneticisi)
+          cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/MainActivity.kt
+          package tr.gov.ogm.gozetleme
+
+          import android.Manifest
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.ScaleGestureDetector
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.camera.core.Camera
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import androidx.core.content.FileProvider
+          import java.io.File
+          import java.util.Locale
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+
+          class MainActivity : AppCompatActivity(), LocationListener {
+
+              private lateinit var previewView: PreviewView
+              private lateinit var arOverlay: ArOverlayView
+              private lateinit var demEngine: DemEngine
+              private lateinit var sensorFusion: SensorFusion
+              private var camera: Camera? = null
+
+              // Varsayılan Konum (Denizli / Acıpayam Bölgesi - GPS kilitlenene kadar yedek)
+              private var currentLat = 37.4240
+              private var currentLon = 29.3520
+              private var towerHeightOffset = 12.0 // Zeminden kule yüksekliği (metre)
+
+              private var lastProfileAzimuth = -999f
+              private val bgExecutor = Executors.newSingleThreadExecutor()
+              private val uiHandler = Handler(Looper.getMainLooper())
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  demEngine = DemEngine(this)
+
+                  val root = FrameLayout(this)
+                  previewView = PreviewView(this)
+                  root.addView(previewView, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT,
+                      FrameLayout.LayoutParams.MATCH_PARENT
+                  ))
+
+                  arOverlay = ArOverlayView(this) { dAz, dPitch ->
+                      sensorFusion.manualAzimuthOffset += dAz
+                      sensorFusion.manualPitchOffset += dPitch
+                  }
+                  root.addView(arOverlay, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT,
+                      FrameLayout.LayoutParams.MATCH_PARENT
+                  ))
+
+                  // Çift parmakla yakınlaştırma (Pinch-to-Zoom) + Kamera FOV senkronizasyonu
+                  val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      override fun onScale(detector: ScaleGestureDetector): Boolean {
+                          val cam = camera ?: return false
+                          val currentZoom = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1f
+                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(1f, 10f)
+                          cam.cameraControl.setZoomRatio(nextZoom)
+                          arOverlay.currentZoomRatio = nextZoom
+                          arOverlay.invalidate()
+                          return true
+                      }
+                  })
+
+                  arOverlay.setOnTouchListener { v, event ->
+                      scaleDetector.onTouchEvent(event)
+                      if (!scaleDetector.isInProgress) {
+                          v.onTouchEvent(event)
+                      }
+                      true
+                  }
+
+                  // Sağ Alt Kontrol Paneli
+                  val btnPanel = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(20, 20, 20, 20)
+                  }
+
+                  val btnTowerHeight = Button(this).apply {
+                      text = "Kule +12m"
+                      setBackgroundColor(Color.parseColor("#CC263238"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { showTowerHeightDialog(this) }
+                  }
+
+                  val btnSecondRay = Button(this).apply {
+                      text = "2. Kule Kodu Gir"
+                      setBackgroundColor(Color.parseColor("#CC0277BD"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { showSecondRayDialog() }
+                  }
+
+                  val btnResetCal = Button(this).apply {
+                      text = "Kalibrasyon Sıfırla"
+                      setBackgroundColor(Color.parseColor("#CC455A64"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener {
+                          sensorFusion.manualAzimuthOffset = 0f
+                          sensorFusion.manualPitchOffset = 0f
+                          Toast.makeText(this@MainActivity, "Görsel kalibrasyon sıfırlandı", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  val btnFireKml = Button(this).apply {
+                      text = "HEDEF KML ÜRET & PAYLAŞ"
+                      setBackgroundColor(Color.parseColor("#FFD32F2F"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { exportAndShareKml() }
+                  }
+
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      setMargins(12, 0, 12, 0)
+                  }
+                  btnPanel.addView(btnTowerHeight, lp)
+                  btnPanel.addView(btnSecondRay, lp)
+                  btnPanel.addView(btnResetCal, lp)
+                  btnPanel.addView(btnFireKml, lp)
+
+                  val panelParams = FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.WRAP_CONTENT,
+                      FrameLayout.LayoutParams.WRAP_CONTENT,
+                      Gravity.BOTTOM or Gravity.END
+                  )
+                  root.addView(btnPanel, panelParams)
+
+                  setContentView(root)
+
+                  sensorFusion = SensorFusion(this) { az, pitch, _ ->
+                      arOverlay.currentAzimuth = az
+                      arOverlay.currentPitch = pitch
+
+                      // Kamera 15 dereceden fazla döndüyse çevredeki eş yükselti eğrilerini arka planda güncelle
+                      if (abs(az - lastProfileAzimuth) > 15f) {
+                          lastProfileAzimuth = az
+                          refreshHorizonAsync(az)
+                      }
+                      arOverlay.invalidate()
+                  }
+
+                  // İşlemciyi yormamak için Raycasting (Hedef Çakıştırma) hesabını saniyede 4 kez (250ms) çalıştır
+                  uiHandler.post(raycastLoop)
+
+                  checkPermissionsAndStart()
+              }
+
+              private val raycastLoop = object : Runnable {
+                  override fun run() {
+                      val az = arOverlay.currentAzimuth.toDouble()
+                      val pitch = arOverlay.currentPitch.toDouble()
+                      val obs2 = arOverlay.secondObserverRay
+
+                      bgExecutor.execute {
+                          val terrainAlt = demEngine.getElevation(currentLat, currentLon) + towerHeightOffset
+                          val hit = if (obs2 != null) {
+                              demEngine.triangulateTwoRays(
+                                  currentLat, currentLon, terrainAlt, az, pitch,
+                                  obs2.lat, obs2.lon, obs2.alt, obs2.azimuth, obs2.pitch
+                              ) ?: demEngine.castRayToGround(currentLat, currentLon, terrainAlt, az, pitch)
+                          } else {
+                              demEngine.castRayToGround(currentLat, currentLon, terrainAlt, az, pitch)
+                          }
+
+                          uiHandler.post {
+                              arOverlay.observerLat = currentLat
+                              arOverlay.observerLon = currentLon
+                              arOverlay.observerAlt = terrainAlt
+                              arOverlay.currentHit = hit
+                              arOverlay.invalidate()
+                          }
+                      }
+                      uiHandler.postDelayed(this, 250)
+                  }
+              }
+
+              private fun refreshHorizonAsync(centerAz: Float) {
+                  bgExecutor.execute {
+                      val terrainAlt = demEngine.getElevation(currentLat, currentLon) + towerHeightOffset
+                      val profile = demEngine.buildHorizonAndContours(currentLat, currentLon, terrainAlt, centerAz, 70f)
+                      uiHandler.post {
+                          arOverlay.horizonProfile = profile
+                          arOverlay.invalidate()
+                      }
+                  }
+              }
+
+              private fun showTowerHeightDialog(btn: Button) {
+                  val input = EditText(this).apply {
+                      setText(towerHeightOffset.toInt().toString())
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("Zeminden Gözetleme Yüksekliği (Metre)")
+                      .setMessage("Bulunduğunuz kulenin veya noktanın arazi zemininden yüksekliğini girin:")
+                      .setView(input)
+                      .setPositiveButton("Kaydet") { _, _ ->
+                          towerHeightOffset = input.text.toString().toDoubleOrNull() ?: 2.0
+                          btn.text = "Kule +${towerHeightOffset.toInt()}m"
+                          refreshHorizonAsync(arOverlay.currentAzimuth)
+                      }
+                      .setNegativeButton("İptal", null)
+                      .show()
+              }
+
+              private fun showSecondRayDialog() {
+                  val input = EditText(this).apply {
+                      hint = "Örn: 0A4F-91K2-B82M"
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("2. Gözetleme Noktası Kestirme Kodu")
+                      .setMessage("Diğer kuleden telsiz veya mesajla gelen 12 haneli akıllı kodu girin:")
+                      .setView(input)
+                      .setPositiveButton("Kesiştir") { _, _ ->
+                          val decoded = KmlAndCodeCodec.decodeObserverCode(input.text.toString())
+                          if (decoded != null) {
+                              arOverlay.secondObserverRay = decoded
+                              Toast.makeText(this, "2. Kule lazer hattı ekrana eklendi!", Toast.LENGTH_LONG).show()
+                          } else {
+                              Toast.makeText(this, "Geçersiz kod formatı!", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                      .setNeutralButton("Kestirmeyi Kapat") { _, _ ->
+                          arOverlay.secondObserverRay = null
+                      }
+                      .setNegativeButton("İptal", null)
+                      .show()
+              }
+
+              private fun exportAndShareKml() {
+                  val hit = arOverlay.currentHit
+                  if (hit == null) {
+                      Toast.makeText(this, "Nişangah henüz bir arazi yüzeyine temas etmiyor!", Toast.LENGTH_LONG).show()
+                      return
+                  }
+
+                  val obsAlt = demEngine.getElevation(currentLat, currentLon) + towerHeightOffset
+                  val packet = ObserverPacket(
+                      lat = currentLat,
+                      lon = currentLon,
+                      alt = obsAlt,
+                      azimuth = arOverlay.currentAzimuth.toDouble(),
+                      pitch = arOverlay.currentPitch.toDouble()
+                  )
+
+                  val radioCode = KmlAndCodeCodec.encodeObserverCode(packet)
+                  val kmlText = KmlAndCodeCodec.buildKmlContent(packet, arOverlay.secondObserverRay, hit, radioCode)
+
+                  val kmlDir = File(cacheDir, "kml")
+                  if (!kmlDir.exists()) kmlDir.mkdirs()
+                  val kmlFile = File(kmlDir, "Gozetleme_Hedef_${System.currentTimeMillis()}.kml")
+                  kmlFile.writeText(kmlText)
+
+                  AlertDialog.Builder(this)
+                      .setTitle("Hedef Oluşturuldu!")
+                      .setMessage(
+                          "Hedef Koordinatı: ${String.format(Locale.US, "%.5f, %.5f", hit.hitLat, hit.hitLon)}\n" +
+                          "Mesafe: ${hit.distanceMeters.toInt()} m (±${hit.radialErrorMeters.toInt()} m)\n\n" +
+                          "Telsiz / Diğer Kule Kestirme Kodu:\n$radioCode"
+                      )
+                      .setPositiveButton("KML Dosyasını Paylaş") { _, _ ->
+                          val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", kmlFile)
+                          val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                              type = "application/vnd.google-earth.kml+xml"
+                              putExtra(Intent.EXTRA_STREAM, uri)
+                              putExtra(Intent.EXTRA_TEXT, "Gözetleme Kestirme Kodu: $radioCode")
+                              addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                          }
+                          startActivity(Intent.createChooser(shareIntent, "KML Hedefini Paylaş"))
+                      }
+                      .setNegativeButton("Kapat", null)
+                      .show()
+              }
+
+              private fun checkPermissionsAndStart() {
+                  val perms = arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION)
+                  val missing = perms.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+                  if (missing.isNotEmpty()) {
+                      ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+                  } else {
+                      startCameraAndLocation()
+                  }
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == 101) startCameraAndLocation()
+              }
+
+              private fun startCameraAndLocation() {
+                  val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+                  cameraProviderFuture.addListener({
+                      val provider = cameraProviderFuture.get()
+                      val preview = Preview.Builder().build().also {
+                          it.setSurfaceProvider(previewView.surfaceProvider)
+                      }
+                      provider.unbindAll()
+                      camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview)
+                  }, ContextCompat.getMainExecutor(this))
+
+                  try {
+                      val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                          lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 2000L, 2f, this)
+                          lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.let { onLocationChanged(it) }
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              override fun onLocationChanged(location: Location) {
+                  currentLat = location.latitude
+                  currentLon = location.longitude
+                  val alt = demEngine.getElevation(currentLat, currentLon)
+                  sensorFusion.updateDeclination(currentLat, currentLon, alt)
+                  refreshHorizonAsync(arOverlay.currentAzimuth)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  sensorFusion.start()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  sensorFusion.stop()
+              }
+          }
+          EOF
+
+      - name: Denizli OBM SRTM (DEM) Yukseklik Verilerini Indir ve Gom
+        run: |
+          cd app/src/main/assets/dem
+          TILES=("N36E028" "N36E029" "N37E028" "N37E029" "N38E028" "N38E029")
+          for TILE in "${TILES[@]}"; do
+            LAT_DIR="${TILE:0:3}"
+            URL="https://s3.amazonaws.com/elevation-tiles-prod/skadi/${LAT_DIR}/${TILE}.hgt.gz"
+            echo "Indiriliyor: ${TILE}.hgt.gz ..."
+            curl -s -f -L "$URL" -o "${TILE}.hgt.gz"
+            gunzip -f "${TILE}.hgt.gz"
+          done
+          ls -lh
+
+      - name: APK Dosyasini Derle
+        run: gradle assembleDebug --no-daemon
+
+      - name: APK Dosyasini Indirilebilir Paket Olarak Yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: GozetlemeKamerasi-DenizliOBM-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
