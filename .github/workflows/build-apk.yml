@@ -92,7 +92,7 @@ jobs:
           -keep class androidx.camera.** { *; }
           EOF
 
-          # 4. app/build.gradle (R8/ProGuard Kod Şifreleme Aktif)
+          # 4. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
@@ -107,8 +107,8 @@ jobs:
                   applicationId "tr.gov.ogm.gozetleme"
                   minSdk 26
                   targetSdk 34
-                  versionCode 7
-                  versionName "2.0-CihanTurkmen-Pro"
+                  versionCode 8
+                  versionName "2.1-SecureAdminPro"
               }
 
               signingConfigs {
@@ -184,7 +184,7 @@ jobs:
           </vector>
           EOF
 
-          # 7. AndroidManifest.xml (İnternet İzni + Giriş Ekranı Başlangıç)
+          # 7. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -238,7 +238,7 @@ jobs:
           </manifest>
           EOF
 
-          # 8. SecurityManager.kt (Lisanslama ve Anti-Tamper Güvenlik Motoru)
+          # 8. SecurityManager.kt (Güvenli Kriptografik Motor & Talep Numarası Yönetimi)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SecurityManager.kt
           package tr.gov.ogm.gozetleme
 
@@ -250,17 +250,11 @@ jobs:
           import java.util.Locale
 
           object SecurityManager {
-              private const val PREF_NAME = "ogm_sec_vault_v2"
+              private const val PREF_NAME = "ogm_sec_vault_v3"
 
-              // Gizli kriptografik tuz (XOR ile gizlenmiş, APK içinde düz metin olarak görünmez)
               private fun getSecretSalt(): String {
                   val data = intArrayOf(76, 87, 94, 72, 71, 89, 124, 99, 108, 121, 102, 100, 108, 103, 59, 57, 59, 63)
                   return data.map { (it xor 9).toChar() }.joinToString("")
-              }
-
-              fun isEnvironmentSafe(context: Context): Boolean {
-                  val isDebuggable = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
-                  return !Debug.isDebuggerConnected() && !isDebuggable
               }
 
               fun sha256(input: String): String {
@@ -272,6 +266,11 @@ jobs:
                   val normalized = "${username.trim().lowercase(Locale.US)}|${fullName.trim().lowercase(Locale.US)}|${dutyPlace.trim().lowercase(Locale.US)}|${phone.trim()}|${getSecretSalt()}"
                   val hash = sha256(normalized)
                   return "OGM-${hash.substring(0, 4)}-${hash.substring(4, 8)}"
+              }
+
+              fun generateRequestCode(username: String, phone: String): String {
+                  val raw = sha256("$username|$phone|${getSecretSalt()}")
+                  return "TALEP-${raw.substring(0, 4)}-${raw.substring(4, 8)}"
               }
 
               private fun obfuscate(text: String): String {
@@ -305,8 +304,9 @@ jobs:
                   phone: String,
                   username: String,
                   pass: String
-              ): String {
+              ): Triple<String, String, String> {
                   val license = generateLicenseKey(username, fullName, dutyPlace, phone)
+                  val requestCode = generateRequestCode(username, phone)
                   val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
                   prefs.edit()
                       .putString("u_name", obfuscate(username.trim()))
@@ -315,9 +315,10 @@ jobs:
                       .putString("u_duty", obfuscate(dutyPlace.trim()))
                       .putString("u_phone", obfuscate(phone.trim()))
                       .putString("u_expected_lic", sha256(license))
+                      .putString("u_req_code", requestCode)
                       .putBoolean("u_activated", false)
                       .apply()
-                  return license
+                  return Triple(license, requestCode, username.trim())
               }
 
               fun verifyAndActivateLicense(context: Context, inputKey: String): Boolean {
@@ -331,6 +332,11 @@ jobs:
                   return false
               }
 
+              // Yönetici paneli için herhangi bir talep kodundan gerçek lisans üretme fonksiyonu
+              fun adminGenerateLicenseForUser(username: String, phone: String, fullName: String, dutyPlace: String): String {
+                  return generateLicenseKey(username, fullName, dutyPlace, phone)
+              }
+
               fun validateLogin(context: Context, username: String, pass: String): Pair<Boolean, String> {
                   val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
                   val savedUser = deobfuscate(prefs.getString("u_name", "") ?: "")
@@ -338,14 +344,14 @@ jobs:
                   val activated = prefs.getBoolean("u_activated", false)
 
                   if (savedUser.isEmpty()) {
-                      return Pair(false, "Kayıtlı kullanıcı bulunamadı. Lütfen önce kullanıcı kaydı oluşturun.")
+                      return Pair(false, "Kayıtlı kullanıcı bulunamadı. Lütfen önce kayıt olun.")
                   }
                   if (!savedUser.equals(username.trim(), ignoreCase = true) ||
                       savedPassHash != sha256(pass.trim() + getSecretSalt())) {
                       return Pair(false, "Kullanıcı adı veya şifre hatalı!")
                   }
                   if (!activated) {
-                      return Pair(false, "Hesabınız henüz lisans kodu ile aktifleştirilmemiş! Lütfen Lisans Kodu Gir ekranından aktivasyon yapın.")
+                      return Pair(false, "Hesabınız henüz lisans kodu ile aktifleştirilmemiş!")
                   }
                   return Pair(true, "Giriş Başarılı")
               }
@@ -369,7 +375,7 @@ jobs:
           }
           EOF
 
-          # 9. AuthActivity.kt (Giriş, Kayıt, E-Posta İletimi ve Lisans Aktivasyon Ekranı)
+          # 9. AuthActivity.kt (Gizli Yönetici Lisans Üreticisi Entegreli)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/AuthActivity.kt
           package tr.gov.ogm.gozetleme
 
@@ -388,6 +394,7 @@ jobs:
           class AuthActivity : AppCompatActivity() {
 
               private lateinit var containerLayout: LinearLayout
+              private var devClickCount = 0
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -440,8 +447,79 @@ jobs:
                       typeface = Typeface.DEFAULT_BOLD
                       gravity = Gravity.CENTER
                       setPadding(0, 64, 0, 16)
+                      setOnClickListener {
+                          devClickCount++
+                          if (devClickCount >= 5) {
+                              devClickCount = 0
+                              showAdminLoginDialog()
+                          }
+                      }
                   }
                   containerLayout.addView(devInfo)
+              }
+
+              private fun showAdminLoginDialog() {
+                  val input = EditText(this).apply {
+                      hint = "Yönetici Şifresi"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setPadding(40, 30, 40, 30)
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("🔑 Cihan Türkmen - Yönetici Modu")
+                      .setMessage("Yönetici şifresini girin:")
+                      .setView(input)
+                      .setPositiveButton("Giriş Yap") { _, _ ->
+                          if (input.text.toString() == "Cihan2026!") {
+                              showAdminLicenseGeneratorPanel()
+                          } else {
+                              Toast.makeText(this, "Hatalı yönetici şifresi!", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                      .setNegativeButton("İptal", null)
+                      .show()
+              }
+
+              private fun showAdminLicenseGeneratorPanel() {
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 30, 40, 30)
+                  }
+
+                  val etUser = EditText(this).apply { hint = "Kullanıcı Adı" }
+                  val etPhone = EditText(this).apply { hint = "Telefon Numarası" }
+                  val etFull = EditText(this).apply { hint = "Ad Soyad" }
+                  val etDuty = EditText(this).apply { hint = "Görev Yeri" }
+
+                  layout.addView(etUser)
+                  layout.addView(etPhone)
+                  layout.addView(etFull)
+                  layout.addView(etDuty)
+
+                  AlertDialog.Builder(this)
+                      .setTitle("🛠️ Yönetici Lisans Üretici")
+                      .setView(layout)
+                      .setPositiveButton("Lisans Kodu Üret") { _, _ ->
+                          val u = etUser.text.toString().trim()
+                          val p = etPhone.text.toString().trim()
+                          val f = etFull.text.toString().trim()
+                          val d = etDuty.text.toString().trim()
+                          if (u.isNotEmpty() && p.isNotEmpty()) {
+                              val lic = SecurityManager.adminGenerateLicenseForUser(u, p, f, d)
+                              AlertDialog.Builder(this)
+                                  .setTitle("Üretilen Lisans Kodu")
+                                  .setMessage(lic)
+                                  .setPositiveButton("Kopyala ve Kapat") { _, _ ->
+                                      val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                      clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Lisans", lic))
+                                      Toast.makeText(this, "Kopyalandı!", Toast.LENGTH_SHORT).show()
+                                  }
+                                  .show()
+                          } else {
+                              Toast.makeText(this, "Kullanıcı adı ve telefon zorunludur!", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                      .setNegativeButton("Kapat", null)
+                      .show()
               }
 
               private fun createStyledInput(hintText: String, isPassword: Boolean = false, isPhone: Boolean = false): EditText {
@@ -502,7 +580,6 @@ jobs:
                       text = "LİSANS AKTİVASYON KODU GİR"
                       setBackgroundColor(Color.parseColor("#455A64"))
                       setTextColor(Color.WHITE)
-                      visibility = if (SecurityManager.isRegistered(this@AuthActivity) && !SecurityManager.isActivated(this@AuthActivity)) View.VISIBLE else View.VISIBLE
                       setOnClickListener { showLicenseActivationDialog() }
                   }
 
@@ -546,11 +623,11 @@ jobs:
                               return@setOnClickListener
                           }
 
-                          val licenseKey = SecurityManager.saveUserRegistration(
+                          val (_, requestCode, _) = SecurityManager.saveUserRegistration(
                               this@AuthActivity, full, duty, phone, user, pass
                           )
 
-                          sendLicenseEmailToAdmin(full, duty, phone, user, licenseKey)
+                          sendRequestEmailToAdmin(full, duty, phone, user, requestCode)
                       }
                   }
 
@@ -572,7 +649,7 @@ jobs:
                   buildFooter()
               }
 
-              private fun sendLicenseEmailToAdmin(fullName: String, dutyPlace: String, phone: String, username: String, licenseKey: String) {
+              private fun sendRequestEmailToAdmin(fullName: String, dutyPlace: String, phone: String, username: String, requestCode: String) {
                   val subject = "OGM Gözetleme CBS - Yeni Lisans Talebi ($fullName)"
                   val body = """
                       OGM Gözetleme CBS Yeni Kullanıcı Lisans Talebi:
@@ -582,9 +659,9 @@ jobs:
                       Telefon        : $phone
                       Kullanıcı Adı  : $username
                       
-                      Üretilen Lisans Aktivasyon Kodu:
-                      $licenseKey
+                      Talep Kodu     : $requestCode
                       -----------------------------------------------
+                      Not: Gerçek lisans anahtarı kullanıcı tarafından görünmez. Lütfen yönetici panelinden bu talep için lisans kodu üretip kullanıcıya iletin.
                       Geliştirici: Cihan Türkmen
                   """.trimIndent()
 
@@ -595,7 +672,7 @@ jobs:
                           putExtra(Intent.EXTRA_SUBJECT, subject)
                           putExtra(Intent.EXTRA_TEXT, body)
                       }
-                      startActivity(Intent.createChooser(mailIntent, "Lisans Talebini E-Posta İle Gönder"))
+                      startActivity(Intent.createChooser(mailIntent, "Lisans Talebini Gönder"))
                   } catch (e: Exception) {
                       val fallback = Intent(Intent.ACTION_SEND).apply {
                           type = "message/rfc822"
@@ -603,7 +680,7 @@ jobs:
                           putExtra(Intent.EXTRA_SUBJECT, subject)
                           putExtra(Intent.EXTRA_TEXT, body)
                       }
-                      startActivity(Intent.createChooser(fallback, "E-Posta Uygulaması Seçin"))
+                      startActivity(Intent.createChooser(fallback, "E-Posta Seçin"))
                   }
 
                   showLicenseActivationDialog()
@@ -617,7 +694,7 @@ jobs:
 
                   AlertDialog.Builder(this)
                       .setTitle("Lisans Aktivasyon Kodu")
-                      .setMessage("Yönetici (Cihan Türkmen - cihantrkmen@gmail.com) tarafından tarafınıza iletilen Lisans Kodunu girin:")
+                      .setMessage("Yönetici (Cihan Türkmen) tarafından tarafınıza iletilen OGM-XXXX-XXXX formatındaki Lisans Kodunu girin:")
                       .setView(input)
                       .setCancelable(false)
                       .setPositiveButton("Aktifleştir") { _, _ ->
@@ -626,7 +703,7 @@ jobs:
                               Toast.makeText(this, "Lisans başarıyla aktifleştirildi! Şimdi giriş yapabilirsiniz.", Toast.LENGTH_LONG).show()
                               showLoginView()
                           } else {
-                              Toast.makeText(this, "Geçersiz Lisans Kodu! Lütfen kontrol edin.", Toast.LENGTH_LONG).show()
+                              Toast.makeText(this, "Geçersiz Lisans Kodu!", Toast.LENGTH_LONG).show()
                           }
                       }
                       .setNegativeButton("Daha Sonra") { _, _ ->
@@ -637,7 +714,7 @@ jobs:
           }
           EOF
 
-          # 10. DemEngine.kt (Otomatik GPS ve 28 OBM Bölge Seçimli Harita İndirme Motoru)
+          # 10. DemEngine.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/DemEngine.kt
           package tr.gov.ogm.gozetleme
 
@@ -1200,7 +1277,7 @@ jobs:
           }
           EOF
 
-          # 12. SensorFusion.kt (3B Optik Kamera Vektörü - Sıfır Çapraz Etkileşim)
+          # 12. SensorFusion.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
           package tr.gov.ogm.gozetleme
 
@@ -1251,7 +1328,6 @@ jobs:
 
                   SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
 
-                  // Arka kamera optik bakış vektörü (-Z)
                   val forwardEast = -rotationMatrix[2].toDouble()
                   val forwardNorth = -rotationMatrix[5].toDouble()
                   val forwardUp = -rotationMatrix[8].toDouble()
@@ -1275,7 +1351,7 @@ jobs:
           }
           EOF
 
-          # 13. ArOverlayView.kt (Geliştirici İmzası + Ufuk Çizgisi)
+          # 13. ArOverlayView.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/ArOverlayView.kt
           package tr.gov.ogm.gozetleme
 
@@ -1484,13 +1560,12 @@ jobs:
                       paintText.color = Color.WHITE
                   }
 
-                  // Sol Alt Köşe: Geliştirici Cihan Türkmen ve Aktif Personel İmzası
                   canvas.drawText("Geliştirici: Cihan Türkmen | $activeUserLabel", 28f, h - 24f, paintDevSignature)
               }
           }
           EOF
 
-          # 14. MainActivity.kt (Bölge Seçimi + Otomatik GPS Harita İndirme Entegreli)
+          # 14. MainActivity.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/MainActivity.kt
           package tr.gov.ogm.gozetleme
 
@@ -1888,7 +1963,6 @@ jobs:
                   currentLat = location.latitude
                   currentLon = location.longitude
 
-                  // Denizli OBM dışında bir GPS konumu algılanırsa otomatik indirme öner:
                   if (!promptedForMissingGpsTile && !demEngine.isTileAvailable(currentLat, currentLon)) {
                       promptedForMissingGpsTile = true
                       val tileKey = demEngine.formatTileKey(kotlin.math.floor(currentLat).toInt(), kotlin.math.floor(currentLon).toInt())
@@ -1932,7 +2006,7 @@ jobs:
           done
           ls -lh
 
-      - name: Kodlari Sifrele (ProGuard/R8) ve Imzali Release APK Derle
+      - name: Kodlari Guvenle Sifrele ve Imzali Release APK Derle
         run: gradle assembleRelease --stacktrace --no-daemon
 
       - name: APK Dosyasini Indirilebilir Paket Olarak Yukle
