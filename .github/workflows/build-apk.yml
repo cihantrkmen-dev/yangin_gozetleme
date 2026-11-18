@@ -36,6 +36,14 @@ jobs:
           mkdir -p app/src/main/res/drawable
           mkdir -p app/src/main/assets/dem
 
+          # Özel Dijital İmza Anahtarı (Release Keystore) Oluştur
+          keytool -genkeypair -v \
+            -keystore app/ogm-release.keystore \
+            -alias ogm_cihan \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass CihanOgm2026! -keypass CihanOgm2026! \
+            -dname "CN=Cihan Turkmen, OU=OGM, O=Orman Genel Mudurlugu, L=Denizli, S=Denizli, C=TR"
+
           # 1. settings.gradle
           cat << 'EOF' > settings.gradle
           pluginManagement {
@@ -59,7 +67,7 @@ jobs:
           # 2. gradle.properties ve root build.gradle
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.jvmargs=-Xmx2560m -Dfile.encoding=UTF-8
           EOF
 
           cat << 'EOF' > build.gradle
@@ -69,7 +77,22 @@ jobs:
           }
           EOF
 
-          # 3. app/build.gradle
+          # 3. ProGuard / R8 Kod Gizleme ve Koruma Kuralları
+          cat << 'EOF' > app/proguard-rules.pro
+          -optimizationpasses 5
+          -dontusemixedcaseclassnames
+          -dontskipnonpubliclibraryclasses
+          -verbose
+          -repackageclasses 'o'
+          -allowaccessmodification
+          -keepattributes *Annotation*
+          -keep public class tr.gov.ogm.gozetleme.AuthActivity
+          -keep public class tr.gov.ogm.gozetleme.MainActivity
+          -dontwarn androidx.camera.**
+          -keep class androidx.camera.** { *; }
+          EOF
+
+          # 4. app/build.gradle (R8/ProGuard Kod Şifreleme Aktif)
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
@@ -84,13 +107,28 @@ jobs:
                   applicationId "tr.gov.ogm.gozetleme"
                   minSdk 26
                   targetSdk 34
-                  versionCode 6
-                  versionName "1.5-TrueVectorFix"
+                  versionCode 7
+                  versionName "2.0-CihanTurkmen-Pro"
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file("ogm-release.keystore")
+                      storePassword "CihanOgm2026!"
+                      keyAlias "ogm_cihan"
+                      keyPassword "CihanOgm2026!"
+                  }
               }
 
               buildTypes {
                   release {
-                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                      minifyEnabled true
+                      shrinkResources true
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+                  debug {
+                      signingConfig signingConfigs.release
                   }
               }
 
@@ -121,7 +159,7 @@ jobs:
           }
           EOF
 
-          # 4. file_paths.xml
+          # 5. file_paths.xml
           cat << 'EOF' > app/src/main/res/xml/file_paths.xml
           <?xml version="1.0" encoding="utf-8"?>
           <paths>
@@ -130,7 +168,7 @@ jobs:
           </paths>
           EOF
 
-          # 5. Durbun Uygulama Simgesi (Vector Drawable)
+          # 6. Dürbün Uygulama Simgesi
           cat << 'EOF' > app/src/main/res/drawable/ic_binoculars.xml
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -146,7 +184,7 @@ jobs:
           </vector>
           EOF
 
-          # 6. AndroidManifest.xml
+          # 7. AndroidManifest.xml (İnternet İzni + Giriş Ekranı Başlangıç)
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -156,13 +194,14 @@ jobs:
               <uses-feature android:name="android.hardware.sensor.compass" android:required="true" />
               <uses-feature android:name="android.hardware.location.gps" android:required="true" />
 
+              <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.CAMERA" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
               <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
 
               <application
-                  android:allowBackup="true"
+                  android:allowBackup="false"
                   android:label="OGM Gözetleme CBS"
                   android:icon="@drawable/ic_binoculars"
                   android:roundIcon="@drawable/ic_binoculars"
@@ -170,15 +209,21 @@ jobs:
                   android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
 
                   <activity
-                      android:name=".MainActivity"
+                      android:name=".AuthActivity"
                       android:exported="true"
-                      android:screenOrientation="landscape"
-                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      android:screenOrientation="portrait"
+                      android:windowSoftInputMode="adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="false"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden" />
 
                   <provider
                       android:name="androidx.core.content.FileProvider"
@@ -193,7 +238,406 @@ jobs:
           </manifest>
           EOF
 
-          # 7. DemEngine.kt
+          # 8. SecurityManager.kt (Lisanslama ve Anti-Tamper Güvenlik Motoru)
+          cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SecurityManager.kt
+          package tr.gov.ogm.gozetleme
+
+          import android.content.Context
+          import android.content.pm.ApplicationInfo
+          import android.os.Debug
+          import android.util.Base64
+          import java.security.MessageDigest
+          import java.util.Locale
+
+          object SecurityManager {
+              private const val PREF_NAME = "ogm_sec_vault_v2"
+
+              // Gizli kriptografik tuz (XOR ile gizlenmiş, APK içinde düz metin olarak görünmez)
+              private fun getSecretSalt(): String {
+                  val data = intArrayOf(76, 87, 94, 72, 71, 89, 124, 99, 108, 121, 102, 100, 108, 103, 59, 57, 59, 63)
+                  return data.map { (it xor 9).toChar() }.joinToString("")
+              }
+
+              fun isEnvironmentSafe(context: Context): Boolean {
+                  val isDebuggable = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                  return !Debug.isDebuggerConnected() && !isDebuggable
+              }
+
+              fun sha256(input: String): String {
+                  val bytes = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
+                  return bytes.joinToString("") { "%02X".format(it) }
+              }
+
+              fun generateLicenseKey(username: String, fullName: String, dutyPlace: String, phone: String): String {
+                  val normalized = "${username.trim().lowercase(Locale.US)}|${fullName.trim().lowercase(Locale.US)}|${dutyPlace.trim().lowercase(Locale.US)}|${phone.trim()}|${getSecretSalt()}"
+                  val hash = sha256(normalized)
+                  return "OGM-${hash.substring(0, 4)}-${hash.substring(4, 8)}"
+              }
+
+              private fun obfuscate(text: String): String {
+                  val key = getSecretSalt().toByteArray()
+                  val input = text.toByteArray(Charsets.UTF_8)
+                  val out = ByteArray(input.size)
+                  for (i in input.indices) {
+                      out[i] = (input[i].toInt() xor key[i % key.size].toInt()).toByte()
+                  }
+                  return Base64.encodeToString(out, Base64.NO_WRAP)
+              }
+
+              private fun deobfuscate(encoded: String): String {
+                  return try {
+                      val key = getSecretSalt().toByteArray()
+                      val input = Base64.decode(encoded, Base64.NO_WRAP)
+                      val out = ByteArray(input.size)
+                      for (i in input.indices) {
+                          out[i] = (input[i].toInt() xor key[i % key.size].toInt()).toByte()
+                      }
+                      String(out, Charsets.UTF_8)
+                  } catch (e: Exception) {
+                      ""
+                  }
+              }
+
+              fun saveUserRegistration(
+                  context: Context,
+                  fullName: String,
+                  dutyPlace: String,
+                  phone: String,
+                  username: String,
+                  pass: String
+              ): String {
+                  val license = generateLicenseKey(username, fullName, dutyPlace, phone)
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  prefs.edit()
+                      .putString("u_name", obfuscate(username.trim()))
+                      .putString("u_pass", sha256(pass.trim() + getSecretSalt()))
+                      .putString("u_full", obfuscate(fullName.trim()))
+                      .putString("u_duty", obfuscate(dutyPlace.trim()))
+                      .putString("u_phone", obfuscate(phone.trim()))
+                      .putString("u_expected_lic", sha256(license))
+                      .putBoolean("u_activated", false)
+                      .apply()
+                  return license
+              }
+
+              fun verifyAndActivateLicense(context: Context, inputKey: String): Boolean {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  val expectedHash = prefs.getString("u_expected_lic", "") ?: ""
+                  val cleanInput = inputKey.trim().uppercase(Locale.US)
+                  if (expectedHash.isNotEmpty() && sha256(cleanInput) == expectedHash) {
+                      prefs.edit().putBoolean("u_activated", true).apply()
+                      return true
+                  }
+                  return false
+              }
+
+              fun validateLogin(context: Context, username: String, pass: String): Pair<Boolean, String> {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  val savedUser = deobfuscate(prefs.getString("u_name", "") ?: "")
+                  val savedPassHash = prefs.getString("u_pass", "") ?: ""
+                  val activated = prefs.getBoolean("u_activated", false)
+
+                  if (savedUser.isEmpty()) {
+                      return Pair(false, "Kayıtlı kullanıcı bulunamadı. Lütfen önce kullanıcı kaydı oluşturun.")
+                  }
+                  if (!savedUser.equals(username.trim(), ignoreCase = true) ||
+                      savedPassHash != sha256(pass.trim() + getSecretSalt())) {
+                      return Pair(false, "Kullanıcı adı veya şifre hatalı!")
+                  }
+                  if (!activated) {
+                      return Pair(false, "Hesabınız henüz lisans kodu ile aktifleştirilmemiş! Lütfen Lisans Kodu Gir ekranından aktivasyon yapın.")
+                  }
+                  return Pair(true, "Giriş Başarılı")
+              }
+
+              fun isRegistered(context: Context): Boolean {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  return !prefs.getString("u_name", "").isNullOrEmpty()
+              }
+
+              fun isActivated(context: Context): Boolean {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  return prefs.getBoolean("u_activated", false)
+              }
+
+              fun getActiveUserSummary(context: Context): String {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  val full = deobfuscate(prefs.getString("u_full", "") ?: "")
+                  val duty = deobfuscate(prefs.getString("u_duty", "") ?: "")
+                  return if (full.isNotEmpty()) "$full ($duty)" else "OGM Personeli"
+              }
+          }
+          EOF
+
+          # 9. AuthActivity.kt (Giriş, Kayıt, E-Posta İletimi ve Lisans Aktivasyon Ekranı)
+          cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/AuthActivity.kt
+          package tr.gov.ogm.gozetleme
+
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+
+          class AuthActivity : AppCompatActivity() {
+
+              private lateinit var containerLayout: LinearLayout
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val scroll = ScrollView(this).apply {
+                      isFillViewport = true
+                      setBackgroundColor(Color.parseColor("#102015"))
+                  }
+
+                  containerLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(56, 72, 56, 56)
+                  }
+
+                  scroll.addView(containerLayout)
+                  setContentView(scroll)
+
+                  showLoginView()
+              }
+
+              private fun buildHeader(subtitle: String) {
+                  containerLayout.removeAllViews()
+
+                  val title = TextView(this).apply {
+                      text = "OGM GÖZETLEME CBS"
+                      textSize = 26f
+                      setTextColor(Color.parseColor("#00E676"))
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                  }
+
+                  val sub = TextView(this).apply {
+                      text = subtitle
+                      textSize = 15f
+                      setTextColor(Color.parseColor("#B0BEC5"))
+                      gravity = Gravity.CENTER
+                      setPadding(0, 12, 0, 44)
+                  }
+
+                  containerLayout.addView(title)
+                  containerLayout.addView(sub)
+              }
+
+              private fun buildFooter() {
+                  val devInfo = TextView(this).apply {
+                      text = "Geliştirici: Cihan Türkmen\nDenizli Orman Bölge Müdürlüğü © 2026"
+                      textSize = 13f
+                      setTextColor(Color.parseColor("#81C784"))
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      setPadding(0, 64, 0, 16)
+                  }
+                  containerLayout.addView(devInfo)
+              }
+
+              private fun createStyledInput(hintText: String, isPassword: Boolean = false, isPhone: Boolean = false): EditText {
+                  return EditText(this).apply {
+                      hint = hintText
+                      setHintTextColor(Color.parseColor("#78909C"))
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.parseColor("#1E3324"))
+                      setPadding(36, 32, 36, 32)
+                      inputType = when {
+                          isPassword -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                          isPhone -> InputType.TYPE_CLASS_PHONE
+                          else -> InputType.TYPE_CLASS_TEXT
+                      }
+                  }
+              }
+
+              private fun showLoginView() {
+                  buildHeader("Yangın Gözetleme ve Arazi Çakıştırma Sistemi")
+
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply { setMargins(0, 16, 0, 16) }
+
+                  val etUser = createStyledInput("Kullanıcı Adı")
+                  val etPass = createStyledInput("Şifre", isPassword = true)
+
+                  val btnLogin = Button(this).apply {
+                      text = "GİRİŞ YAP"
+                      setBackgroundColor(Color.parseColor("#2E7D32"))
+                      setTextColor(Color.WHITE)
+                      textSize = 16f
+                      setPadding(0, 28, 0, 28)
+                      setOnClickListener {
+                          val (ok, msg) = SecurityManager.validateLogin(
+                              this@AuthActivity,
+                              etUser.text.toString(),
+                              etPass.text.toString()
+                          )
+                          if (ok) {
+                              startActivity(Intent(this@AuthActivity, MainActivity::class.java))
+                              finish()
+                          } else {
+                              Toast.makeText(this@AuthActivity, msg, Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+
+                  val btnRegister = Button(this).apply {
+                      text = "YENİ KULLANICI EKLE / KAYIT OL"
+                      setBackgroundColor(Color.parseColor("#0277BD"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { showRegisterView() }
+                  }
+
+                  val btnActivate = Button(this).apply {
+                      text = "LİSANS AKTİVASYON KODU GİR"
+                      setBackgroundColor(Color.parseColor("#455A64"))
+                      setTextColor(Color.WHITE)
+                      visibility = if (SecurityManager.isRegistered(this@AuthActivity) && !SecurityManager.isActivated(this@AuthActivity)) View.VISIBLE else View.VISIBLE
+                      setOnClickListener { showLicenseActivationDialog() }
+                  }
+
+                  containerLayout.addView(etUser, lp)
+                  containerLayout.addView(etPass, lp)
+                  containerLayout.addView(btnLogin, lp)
+                  containerLayout.addView(btnRegister, lp)
+                  containerLayout.addView(btnActivate, lp)
+
+                  buildFooter()
+              }
+
+              private fun showRegisterView() {
+                  buildHeader("Yeni Kullanıcı Kaydı ve Lisans Talebi")
+
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply { setMargins(0, 12, 0, 12) }
+
+                  val etFullName = createStyledInput("Ad Soyad (Örn: Ahmet Yılmaz)")
+                  val etDutyPlace = createStyledInput("Görev Yeri (Örn: Denizli OBM - Akdağ Kulesi)")
+                  val etPhone = createStyledInput("İletişim Telefon Numarası (05XX...)", isPhone = true)
+                  val etUsername = createStyledInput("Belirleyeceğiniz Kullanıcı Adı")
+                  val etPassword = createStyledInput("Belirleyeceğiniz Şifre", isPassword = true)
+
+                  val btnSubmit = Button(this).apply {
+                      text = "KAYDET VE LİSANS TALEBİ GÖNDER"
+                      setBackgroundColor(Color.parseColor("#D32F2F"))
+                      setTextColor(Color.WHITE)
+                      textSize = 15f
+                      setOnClickListener {
+                          val full = etFullName.text.toString().trim()
+                          val duty = etDutyPlace.text.toString().trim()
+                          val phone = etPhone.text.toString().trim()
+                          val user = etUsername.text.toString().trim()
+                          val pass = etPassword.text.toString().trim()
+
+                          if (full.isEmpty() || duty.isEmpty() || phone.isEmpty() || user.isEmpty() || pass.isEmpty()) {
+                              Toast.makeText(this@AuthActivity, "Lütfen tüm bilgileri eksiksiz doldurun!", Toast.LENGTH_LONG).show()
+                              return@setOnClickListener
+                          }
+
+                          val licenseKey = SecurityManager.saveUserRegistration(
+                              this@AuthActivity, full, duty, phone, user, pass
+                          )
+
+                          sendLicenseEmailToAdmin(full, duty, phone, user, licenseKey)
+                      }
+                  }
+
+                  val btnBack = Button(this).apply {
+                      text = "GİRİŞ EKRANINA DÖN"
+                      setBackgroundColor(Color.parseColor("#37474F"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { showLoginView() }
+                  }
+
+                  containerLayout.addView(etFullName, lp)
+                  containerLayout.addView(etDutyPlace, lp)
+                  containerLayout.addView(etPhone, lp)
+                  containerLayout.addView(etUsername, lp)
+                  containerLayout.addView(etPassword, lp)
+                  containerLayout.addView(btnSubmit, lp)
+                  containerLayout.addView(btnBack, lp)
+
+                  buildFooter()
+              }
+
+              private fun sendLicenseEmailToAdmin(fullName: String, dutyPlace: String, phone: String, username: String, licenseKey: String) {
+                  val subject = "OGM Gözetleme CBS - Yeni Lisans Talebi ($fullName)"
+                  val body = """
+                      OGM Gözetleme CBS Yeni Kullanıcı Lisans Talebi:
+                      -----------------------------------------------
+                      Ad Soyad       : $fullName
+                      Görev Yeri     : $dutyPlace
+                      Telefon        : $phone
+                      Kullanıcı Adı  : $username
+                      
+                      Üretilen Lisans Aktivasyon Kodu:
+                      $licenseKey
+                      -----------------------------------------------
+                      Geliştirici: Cihan Türkmen
+                  """.trimIndent()
+
+                  try {
+                      val mailIntent = Intent(Intent.ACTION_SENDTO).apply {
+                          data = Uri.parse("mailto:cihantrkmen@gmail.com")
+                          putExtra(Intent.EXTRA_EMAIL, arrayOf("cihantrkmen@gmail.com"))
+                          putExtra(Intent.EXTRA_SUBJECT, subject)
+                          putExtra(Intent.EXTRA_TEXT, body)
+                      }
+                      startActivity(Intent.createChooser(mailIntent, "Lisans Talebini E-Posta İle Gönder"))
+                  } catch (e: Exception) {
+                      val fallback = Intent(Intent.ACTION_SEND).apply {
+                          type = "message/rfc822"
+                          putExtra(Intent.EXTRA_EMAIL, arrayOf("cihantrkmen@gmail.com"))
+                          putExtra(Intent.EXTRA_SUBJECT, subject)
+                          putExtra(Intent.EXTRA_TEXT, body)
+                      }
+                      startActivity(Intent.createChooser(fallback, "E-Posta Uygulaması Seçin"))
+                  }
+
+                  showLicenseActivationDialog()
+              }
+
+              private fun showLicenseActivationDialog() {
+                  val input = EditText(this).apply {
+                      hint = "Örn: OGM-4F9A-82C1"
+                      setPadding(40, 30, 40, 30)
+                  }
+
+                  AlertDialog.Builder(this)
+                      .setTitle("Lisans Aktivasyon Kodu")
+                      .setMessage("Yönetici (Cihan Türkmen - cihantrkmen@gmail.com) tarafından tarafınıza iletilen Lisans Kodunu girin:")
+                      .setView(input)
+                      .setCancelable(false)
+                      .setPositiveButton("Aktifleştir") { _, _ ->
+                          val code = input.text.toString()
+                          if (SecurityManager.verifyAndActivateLicense(this, code)) {
+                              Toast.makeText(this, "Lisans başarıyla aktifleştirildi! Şimdi giriş yapabilirsiniz.", Toast.LENGTH_LONG).show()
+                              showLoginView()
+                          } else {
+                              Toast.makeText(this, "Geçersiz Lisans Kodu! Lütfen kontrol edin.", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                      .setNegativeButton("Daha Sonra") { _, _ ->
+                          showLoginView()
+                      }
+                      .show()
+              }
+          }
+          EOF
+
+          # 10. DemEngine.kt (Otomatik GPS ve 28 OBM Bölge Seçimli Harita İndirme Motoru)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/DemEngine.kt
           package tr.gov.ogm.gozetleme
 
@@ -201,9 +645,12 @@ jobs:
           import java.io.File
           import java.io.FileOutputStream
           import java.io.RandomAccessFile
+          import java.net.HttpURLConnection
+          import java.net.URL
           import java.nio.ByteOrder
           import java.nio.MappedByteBuffer
           import java.nio.channels.FileChannel
+          import java.util.zip.GZIPInputStream
           import kotlin.math.*
 
           data class RayHitResult(
@@ -232,10 +679,98 @@ jobs:
               private val earthRadius = 6371000.0
               private val refractionK = 0.13
 
-              private fun getTileBuffer(latFloor: Int, lonFloor: Int): MappedByteBuffer? {
+              val obmRegions: LinkedHashMap<String, List<String>> = linkedMapOf(
+                  "Denizli OBM (Denizli - Uşak)" to listOf("N36E028", "N36E029", "N37E028", "N37E029", "N38E028", "N38E029"),
+                  "Muğla OBM (Muğla - Aydın)" to listOf("N36E027", "N36E028", "N36E029", "N37E027", "N37E028"),
+                  "İzmir OBM (İzmir - Manisa)" to listOf("N37E026", "N37E027", "N38E026", "N38E027", "N38E028", "N39E027"),
+                  "Antalya OBM" to listOf("N36E029", "N36E030", "N36E031", "N36E032", "N37E029", "N37E030", "N37E031"),
+                  "Isparta OBM (Isparta - Burdur)" to listOf("N37E029", "N37E030", "N37E031", "N38E030", "N38E031"),
+                  "Kütahya OBM" to listOf("N38E029", "N39E029", "N39E030"),
+                  "Balıkesir & Çanakkale OBM" to listOf("N39E026", "N39E027", "N39E028", "N40E026", "N40E027"),
+                  "Bursa & Bilecik OBM" to listOf("N39E028", "N39E029", "N40E028", "N40E029", "N40E030"),
+                  "Mersin & Adana OBM" to listOf("N36E032", "N36E033", "N36E034", "N36E035", "N37E034", "N37E035"),
+                  "Kahramanmaraş & Hatay OBM" to listOf("N36E036", "N37E036", "N37E037", "N38E036"),
+                  "Ankara & Konya & Eskişehir OBM" to listOf("N37E032", "N38E031", "N38E032", "N39E030", "N39E031", "N39E032", "N40E032"),
+                  "Bolu & Kastamonu & Zonguldak OBM" to listOf("N40E031", "N41E031", "N41E032", "N41E033", "N41E034")
+              )
+
+              fun formatTileKey(latFloor: Int, lonFloor: Int): String {
                   val ns = if (latFloor >= 0) "N" else "S"
                   val ew = if (lonFloor >= 0) "E" else "W"
-                  val key = String.format("%s%02d%s%03d", ns, abs(latFloor), ew, abs(lonFloor))
+                  return String.format("%s%02d%s%03d", ns, abs(latFloor), ew, abs(lonFloor))
+              }
+
+              fun isTileAvailable(lat: Double, lon: Double): Boolean {
+                  val key = formatTileKey(floor(lat).toInt(), floor(lon).toInt())
+                  if (mappedTiles.containsKey(key)) return true
+                  val localFile = File(File(context.filesDir, "dem"), "$key.hgt")
+                  if (localFile.exists() && localFile.length() > 1000000) return true
+                  return try {
+                      context.assets.open("dem/$key.hgt").close()
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              fun getSurroundingTilesForGps(lat: Double, lon: Double): List<String> {
+                  val cLat = floor(lat).toInt()
+                  val cLon = floor(lon).toInt()
+                  val list = ArrayList<String>()
+                  for (dLat in 0..0) {
+                      for (dLon in -1..1) {
+                          list.add(formatTileKey(cLat + dLat, cLon + dLon))
+                      }
+                  }
+                  return list.distinct()
+              }
+
+              fun downloadTilesSync(tiles: List<String>, onProgress: (String) -> Unit): Int {
+                  val localDir = File(context.filesDir, "dem")
+                  if (!localDir.exists()) localDir.mkdirs()
+                  var downloadedCount = 0
+
+                  for ((index, tile) in tiles.withIndex()) {
+                      val outFile = File(localDir, "$tile.hgt")
+                      if (outFile.exists() && outFile.length() > 1000000) {
+                          downloadedCount++
+                          continue
+                      }
+
+                      onProgress("İndiriliyor (${index + 1}/${tiles.size}): $tile.hgt ...")
+                      try {
+                          val latDir = tile.substring(0, 3)
+                          val url = URL("https://s3.amazonaws.com/elevation-tiles-prod/skadi/$latDir/$tile.hgt.gz")
+                          val conn = (url.openConnection() as HttpURLConnection).apply {
+                              connectTimeout = 15000
+                              readTimeout = 30000
+                              requestMethod = "GET"
+                          }
+                          if (conn.responseCode == 200) {
+                              val tempFile = File(localDir, "$tile.tmp")
+                              GZIPInputStream(conn.inputStream).use { gis ->
+                                  FileOutputStream(tempFile).use { fos ->
+                                      gis.copyTo(fos)
+                                  }
+                              }
+                              if (tempFile.length() > 1000000) {
+                                  tempFile.renameTo(outFile)
+                                  mappedTiles.remove(tile)
+                                  downloadedCount++
+                              } else {
+                                  tempFile.delete()
+                              }
+                          }
+                          conn.disconnect()
+                      } catch (e: Exception) {
+                          // Devam et
+                      }
+                  }
+                  return downloadedCount
+              }
+
+              private fun getTileBuffer(latFloor: Int, lonFloor: Int): MappedByteBuffer? {
+                  val key = formatTileKey(latFloor, lonFloor)
                   if (mappedTiles.containsKey(key)) return mappedTiles[key]
 
                   return try {
@@ -499,7 +1034,7 @@ jobs:
           }
           EOF
 
-          # 8. KmlAndCodeCodec.kt
+          # 11. KmlAndCodeCodec.kt
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/KmlAndCodeCodec.kt
           package tr.gov.ogm.gozetleme
 
@@ -561,7 +1096,8 @@ jobs:
                   obs1: ObserverPacket,
                   obs2: ObserverPacket?,
                   hit: RayHitResult,
-                  radioCode: String
+                  radioCode: String,
+                  operatorSummary: String
               ): String {
                   val timeStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
                   val polyCoords = hit.polygonPoints.joinToString("\n") {
@@ -591,6 +1127,8 @@ jobs:
           <Document>
               <name>OGM Gözetleme Hedef Raporu - $timeStr</name>
               <ExtendedData>
+                  <Data name="operator"><value>$operatorSummary</value></Data>
+                  <Data name="developer"><value>Cihan Türkmen</value></Data>
                   <Data name="obs1_lat"><value>${obs1.lat}</value></Data>
                   <Data name="obs1_lon"><value>${obs1.lon}</value></Data>
                   <Data name="obs1_alt"><value>${obs1.alt}</value></Data>
@@ -624,12 +1162,14 @@ jobs:
               <Placemark>
                   <name>$modeTitle</name>
                   <description><![CDATA[
+                      <b>Personel:</b> $operatorSummary<br/>
                       <b>Koordinat:</b> ${String.format(Locale.US, "%.5f, %.5f", hit.hitLat, hit.hitLon)}<br/>
                       <b>Rakım:</b> ${String.format(Locale.US, "%.0f", hit.hitEle)} m<br/>
                       <b>Mesafe:</b> ${String.format(Locale.US, "%.0f", hit.distanceMeters)} m<br/>
                       <b>Azimut / Eğim:</b> ${String.format(Locale.US, "%.1f° / %.1f°", obs1.azimuth, obs1.pitch)}<br/>
                       <b>Hata Payı:</b> ±${String.format(Locale.US, "%.0f", hit.radialErrorMeters)} m (Boyuna) / ±${String.format(Locale.US, "%.0f", hit.lateralErrorMeters)} m (Enine)<br/>
-                      <b>Kestirme Telsiz Kodu:</b> $radioCode
+                      <b>Kestirme Telsiz Kodu:</b> $radioCode<br/>
+                      <b>Yazılım Geliştirici:</b> Cihan Türkmen
                   ]]></description>
                   <Point>
                       <altitudeMode>clampToGround</altitudeMode>
@@ -660,7 +1200,7 @@ jobs:
           }
           EOF
 
-          # 9. SensorFusion.kt (KESİN ÇÖZÜM: 3B Kamera Optik Vektörü ile Cross-Coupling ve Gimbal Lock Tamamen Kaldırıldı)
+          # 12. SensorFusion.kt (3B Optik Kamera Vektörü - Sıfır Çapraz Etkileşim)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/SensorFusion.kt
           package tr.gov.ogm.gozetleme
 
@@ -709,22 +1249,15 @@ jobs:
               override fun onSensorChanged(event: SensorEvent?) {
                   if (event?.sensor?.type != Sensor.TYPE_ROTATION_VECTOR) return
 
-                  // Dünya koordinat matrisi: X=Doğu, Y=Kuzey, Z=Gökyüzü (Yerçekimi tersi)
                   SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
 
-                  // Arka kameranın optik bakış yönü her zaman cihazın -Z eksenidir.
-                  // Telefonu yatay veya dikey nasıl tutarsak tutalım, kameranın baktığı 3B birim vektör:
+                  // Arka kamera optik bakış vektörü (-Z)
                   val forwardEast = -rotationMatrix[2].toDouble()
                   val forwardNorth = -rotationMatrix[5].toDouble()
                   val forwardUp = -rotationMatrix[8].toDouble()
 
-                  // 1. AZİMUT: Sadece yatay düzlem (Doğu-Kuzey) izdüşümü.
-                  // Dikey hareket (yukarı/aşağı eğim) azimutu ASLA değiştiremez!
                   val horizMag = hypot(forwardEast, forwardNorth)
                   val rawAzRad = if (horizMag > 1e-4) atan2(forwardEast, forwardNorth) else 0.0
-
-                  // 2. EĞİM (PITCH): Ufuk düzlemi tam 0.0 derecedir.
-                  // Yukarı bakarken (+), aşağı vadiye bakarken (-) değer alır.
                   val rawPitchDeg = Math.toDegrees(atan2(forwardUp, horizMag)).toFloat()
 
                   smoothSinAz = smoothSinAz + alpha * (sin(rawAzRad).toFloat() - smoothSinAz)
@@ -742,7 +1275,7 @@ jobs:
           }
           EOF
 
-          # 10. ArOverlayView.kt (DÜZELTİLDİ: val d -> var d derleme hatası giderildi)
+          # 13. ArOverlayView.kt (Geliştirici İmzası + Ufuk Çizgisi)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/ArOverlayView.kt
           package tr.gov.ogm.gozetleme
 
@@ -770,6 +1303,7 @@ jobs:
               var observerLat = 0.0
               var observerLon = 0.0
               var observerAlt = 0.0
+              var activeUserLabel = ""
 
               private val paintHorizon = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                   color = Color.parseColor("#00FF66")
@@ -798,8 +1332,15 @@ jobs:
 
               private val paintText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                   color = Color.WHITE
-                  textSize = 28f
+                  textSize = 26f
                   typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                  setShadowLayer(4f, 2f, 2f, Color.BLACK)
+              }
+
+              private val paintDevSignature = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#CC00E676")
+                  textSize = 22f
+                  typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                   setShadowLayer(4f, 2f, 2f, Color.BLACK)
               }
 
@@ -924,7 +1465,7 @@ jobs:
                       "AZİMUT: %.1f° | EĞİM: %.1f° | ZOOM: %.1fx | KULE RAKIM: %.0fm",
                       currentAzimuth, currentPitch, currentZoomRatio, observerAlt
                   )
-                  canvas.drawText(hud1, 32f, 48f, paintText)
+                  canvas.drawText(hud1, 28f, 44f, paintText)
 
                   val hit = currentHit
                   if (hit != null) {
@@ -935,18 +1476,21 @@ jobs:
                           modeTag, hit.hitLat, hit.hitLon, hit.distanceMeters, hit.radialErrorMeters, hit.hitEle
                       )
                       paintText.color = Color.parseColor("#00FF66")
-                      canvas.drawText(hud2, 32f, 88f, paintText)
+                      canvas.drawText(hud2, 28f, 82f, paintText)
                       paintText.color = Color.WHITE
                   } else {
                       paintText.color = Color.YELLOW
-                      canvas.drawText("HEDEF: Nişangah 30 km içinde araziye temas etmiyor (Ufuk üstü)", 32f, 88f, paintText)
+                      canvas.drawText("HEDEF: Nişangah 30 km içinde araziye temas etmiyor (Ufuk üstü)", 28f, 82f, paintText)
                       paintText.color = Color.WHITE
                   }
+
+                  // Sol Alt Köşe: Geliştirici Cihan Türkmen ve Aktif Personel İmzası
+                  canvas.drawText("Geliştirici: Cihan Türkmen | $activeUserLabel", 28f, h - 24f, paintDevSignature)
               }
           }
           EOF
 
-          # 11. MainActivity.kt
+          # 14. MainActivity.kt (Bölge Seçimi + Otomatik GPS Harita İndirme Entegreli)
           cat << 'EOF' > app/src/main/java/tr/gov/ogm/gozetleme/MainActivity.kt
           package tr.gov.ogm.gozetleme
 
@@ -989,6 +1533,7 @@ jobs:
               private var currentLat = 37.4180
               private var currentLon = 29.2808
               private var towerHeightOffset = 12.0
+              private var promptedForMissingGpsTile = false
 
               private var lastProfileAzimuth = -999f
               private val bgExecutor = Executors.newSingleThreadExecutor()
@@ -996,6 +1541,12 @@ jobs:
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+
+                  if (!SecurityManager.isActivated(this)) {
+                      startActivity(Intent(this, AuthActivity::class.java))
+                      finish()
+                      return
+                  }
 
                   demEngine = DemEngine(this)
 
@@ -1009,6 +1560,8 @@ jobs:
                   arOverlay = ArOverlayView(this) { dAz, dPitch ->
                       sensorFusion.manualAzimuthOffset += dAz
                       sensorFusion.manualPitchOffset += dPitch
+                  }.apply {
+                      activeUserLabel = SecurityManager.getActiveUserSummary(this@MainActivity)
                   }
                   root.addView(arOverlay, FrameLayout.LayoutParams(
                       FrameLayout.LayoutParams.MATCH_PARENT,
@@ -1038,7 +1591,14 @@ jobs:
                   val btnPanel = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
-                      setPadding(20, 20, 20, 20)
+                      setPadding(16, 16, 16, 16)
+                  }
+
+                  val btnRegionMap = Button(this).apply {
+                      text = "Bölge Haritası İndir"
+                      setBackgroundColor(Color.parseColor("#CC1B5E20"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { showRegionDownloadDialog() }
                   }
 
                   val btnTowerHeight = Button(this).apply {
@@ -1049,14 +1609,14 @@ jobs:
                   }
 
                   val btnSecondRay = Button(this).apply {
-                      text = "2. Kule Kodu Gir"
+                      text = "2. Kule Kodu"
                       setBackgroundColor(Color.parseColor("#CC0277BD"))
                       setTextColor(Color.WHITE)
                       setOnClickListener { showSecondRayDialog() }
                   }
 
                   val btnResetCal = Button(this).apply {
-                      text = "Kalibrasyon Sıfırla"
+                      text = "Sıfırla"
                       setBackgroundColor(Color.parseColor("#CC455A64"))
                       setTextColor(Color.WHITE)
                       setOnClickListener {
@@ -1067,15 +1627,16 @@ jobs:
                   }
 
                   val btnFireKml = Button(this).apply {
-                      text = "HEDEF KML ÜRET & PAYLAŞ"
+                      text = "HEDEF KML ÜRET"
                       setBackgroundColor(Color.parseColor("#FFD32F2F"))
                       setTextColor(Color.WHITE)
                       setOnClickListener { exportAndShareKml() }
                   }
 
                   val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                      setMargins(12, 0, 12, 0)
+                      setMargins(8, 0, 8, 0)
                   }
+                  btnPanel.addView(btnRegionMap, lp)
                   btnPanel.addView(btnTowerHeight, lp)
                   btnPanel.addView(btnSecondRay, lp)
                   btnPanel.addView(btnResetCal, lp)
@@ -1104,6 +1665,56 @@ jobs:
                   uiHandler.post(raycastLoop)
 
                   checkPermissionsAndStart()
+              }
+
+              private fun showRegionDownloadDialog() {
+                  val regionNames = ArrayList<String>()
+                  regionNames.add("📍 Otomatik: Bulunduğum GPS Konumu ve Çevresini İndir")
+                  regionNames.addAll(demEngine.obmRegions.keys)
+
+                  AlertDialog.Builder(this)
+                      .setTitle("Bölge Müdürlüğü Harita (DEM) Verisi İndir")
+                      .setItems(regionNames.toTypedArray()) { _, which ->
+                          val tilesToDownload = if (which == 0) {
+                              demEngine.getSurroundingTilesForGps(currentLat, currentLon)
+                          } else {
+                              val selectedKey = regionNames[which]
+                              demEngine.obmRegions[selectedKey] ?: emptyList()
+                          }
+                          startTileDownloadWithProgress(tilesToDownload)
+                      }
+                      .setNegativeButton("İptal", null)
+                      .show()
+              }
+
+              private fun startTileDownloadWithProgress(tiles: List<String>) {
+                  if (tiles.isEmpty()) return
+                  val progressTv = TextView(this).apply {
+                      text = "Harita sunucusuna bağlanılıyor..."
+                      setPadding(48, 36, 48, 36)
+                      setTextColor(Color.BLACK)
+                  }
+                  val dlg = AlertDialog.Builder(this)
+                      .setTitle("Arazi Yükseklik Verisi İndiriliyor")
+                      .setView(progressTv)
+                      .setCancelable(false)
+                      .create()
+                  dlg.show()
+
+                  bgExecutor.execute {
+                      val count = demEngine.downloadTilesSync(tiles) { status ->
+                          uiHandler.post { progressTv.text = status }
+                      }
+                      uiHandler.post {
+                          dlg.dismiss()
+                          Toast.makeText(
+                              this,
+                              "$count / ${tiles.size} bölge paftası çevrimdışı hafızaya kaydedildi!",
+                              Toast.LENGTH_LONG
+                          ).show()
+                          refreshHorizonAsync(arOverlay.currentAzimuth)
+                      }
+                  }
               }
 
               private val raycastLoop = object : Runnable {
@@ -1204,7 +1815,13 @@ jobs:
                   )
 
                   val radioCode = KmlAndCodeCodec.encodeObserverCode(packet)
-                  val kmlText = KmlAndCodeCodec.buildKmlContent(packet, arOverlay.secondObserverRay, hit, radioCode)
+                  val kmlText = KmlAndCodeCodec.buildKmlContent(
+                      packet,
+                      arOverlay.secondObserverRay,
+                      hit,
+                      radioCode,
+                      arOverlay.activeUserLabel
+                  )
 
                   val kmlDir = File(cacheDir, "kml")
                   if (!kmlDir.exists()) kmlDir.mkdirs()
@@ -1270,6 +1887,21 @@ jobs:
               override fun onLocationChanged(location: Location) {
                   currentLat = location.latitude
                   currentLon = location.longitude
+
+                  // Denizli OBM dışında bir GPS konumu algılanırsa otomatik indirme öner:
+                  if (!promptedForMissingGpsTile && !demEngine.isTileAvailable(currentLat, currentLon)) {
+                      promptedForMissingGpsTile = true
+                      val tileKey = demEngine.formatTileKey(kotlin.math.floor(currentLat).toInt(), kotlin.math.floor(currentLon).toInt())
+                      AlertDialog.Builder(this)
+                          .setTitle("Yeni Bölge Tespit Edildi ($tileKey)")
+                          .setMessage("Bulunduğunuz GPS konumunun arazi yükseklik verisi cihazda yüklü değil. Şimdi otomatik olarak indirilsin mi?")
+                          .setPositiveButton("İndir") { _, _ ->
+                              startTileDownloadWithProgress(demEngine.getSurroundingTilesForGps(currentLat, currentLon))
+                          }
+                          .setNegativeButton("Daha Sonra", null)
+                          .show()
+                  }
+
                   val alt = demEngine.getElevation(currentLat, currentLon)
                   sensorFusion.updateDeclination(currentLat, currentLon, alt)
                   refreshHorizonAsync(arOverlay.currentAzimuth)
@@ -1300,11 +1932,11 @@ jobs:
           done
           ls -lh
 
-      - name: APK Dosyasini Derle
-        run: gradle assembleDebug --stacktrace --no-daemon
+      - name: Kodlari Sifrele (ProGuard/R8) ve Imzali Release APK Derle
+        run: gradle assembleRelease --stacktrace --no-daemon
 
       - name: APK Dosyasini Indirilebilir Paket Olarak Yukle
         uses: actions/upload-artifact@v4
         with:
           name: GozetlemeKamerasi-DenizliOBM-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/release/app-release.apk
